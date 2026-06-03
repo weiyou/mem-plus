@@ -21,7 +21,7 @@
 # Each line looks like:
 #
 #   {"<comm>": {"PID": N, "Mem": "..", "Mem Peak": "..", "RSS": "..",
-#               "CPU%": ".."},
+#               "CPU%": "..", "NCPU%": ".."},
 #    "Total": {"CPU Power": "..", "GPU Power": "..", "GPU%": ".."}}
 #
 # Fields:
@@ -34,7 +34,10 @@
 #               see "RSS vs Mem" below for why it can differ wildly.
 #   CPU%        Instantaneous %CPU, htop-style. Measured with `top -l 2 -s 1`
 #               and reading the SECOND sample, which is a delta over a 1s
-#               interval. (See "WHY CPU% IS MEASURED THIS WAY" below.)
+#               interval. Sums across cores, so a process pinning N threads can
+#               exceed 100%. (See "WHY CPU% IS MEASURED THIS WAY" below.)
+#   NCPU%       CPU% normalized by logical core count (hw.ncpu): CPU% / ncpu.
+#               Caps at ~100% = the process is using the entire machine.
 #   Total       System-wide power, sampled ONCE per invocation:
 #     CPU Power   Package CPU power draw (powermetrics).
 #     GPU Power   GPU power draw (powermetrics).
@@ -99,7 +102,8 @@
 #
 #   * `ps -o cpu` is "short-term CPU usage factor (for scheduling)" — the
 #     kernel's raw scheduler-decay counter (p_estcpu), NOT a percentage. It is
-#     near 0 almost always. (This was the old, misnamed "NCPU%" field; removed.)
+#     near 0 almost always. (This was the old data source for "NCPU%". NCPU% is
+#     now derived from the good top number instead: CPU% / logical core count.)
 #
 # An accurate instantaneous %CPU requires sampling cumulative CPU time TWICE
 # over an interval and dividing the delta by wall-clock time — exactly what
@@ -165,6 +169,10 @@ pid_args=()
 for p in $pids; do pid_args+=(-pid $p); done
 top_data=$(top -l 2 -s 1 $pid_args -stats pid,cpu 2>/dev/null)
 
+# Logical core count, for normalizing CPU% (NCPU% = CPU% / ncpu)
+ncpu=$(sysctl -n hw.ncpu 2>/dev/null)
+ncpu=${ncpu:-1}
+
 typeset -A cpu_map
 while read -r tp tc; do
     cpu_map[$tp]=$tc
@@ -184,12 +192,15 @@ for pid in $pids; do
     # RSS (resident set size) for comparison, like mem() in zshrc
     rss=$(ps -o rss= -p $pid | awk '{printf "%.1f MB", $1/1024}')
 
-    # CPU — instantaneous, from the top -l 2 second-sample map above
-    cpu_pct=$(printf "%.1f" "${cpu_map[$pid]:-0}")
+    # CPU — instantaneous, from the top -l 2 second-sample map above.
+    # CPU% sums across cores; NCPU% normalizes by logical core count.
+    cpu_raw=${cpu_map[$pid]:-0}
+    cpu_pct=$(printf "%.1f" "$cpu_raw")
+    ncpu_pct=$(awk -v c="$cpu_raw" -v n="$ncpu" 'BEGIN{printf "%.1f", c/n}')
 
     # Valid JSON output (one line per process — pipe to `jq .` to beautify)
     cat <<EOF
-{"$proc_name": {"PID": $pid, "Mem": "${mem:-N/A}", "Mem Peak": "${mem_peak:-N/A}", "RSS": "${rss:-N/A}", "CPU%": "${cpu_pct}%"}, "Total": {"CPU Power": "${cpu_power:-N/A}", "GPU Power": "${gpu_power:-N/A}", "GPU%": "${gpu_pct:-N/A}%"}}
+{"$proc_name": {"PID": $pid, "Mem": "${mem:-N/A}", "Mem Peak": "${mem_peak:-N/A}", "RSS": "${rss:-N/A}", "CPU%": "${cpu_pct}%", "NCPU%": "${ncpu_pct}%"}, "Total": {"CPU Power": "${cpu_power:-N/A}", "GPU Power": "${gpu_power:-N/A}", "GPU%": "${gpu_pct:-N/A}%"}}
 EOF
 
 done
