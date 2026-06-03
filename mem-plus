@@ -1,0 +1,154 @@
+#!/bin/zsh
+# =============================================================================
+# mem-plus - Compact, one-line JSON memory/CPU/power snapshot for processes
+# =============================================================================
+#
+# Usage:
+#     mem-plus <process-name-or-pattern>
+#
+# Example:
+#     mem-plus llama-server
+#     mem-plus mlx_lm.generate
+#     mem-plus "llama-server|python"      # pattern is passed to pgrep -f
+#
+# -----------------------------------------------------------------------------
+# WHAT IT PRINTS
+# -----------------------------------------------------------------------------
+# One JSON object PER MATCHING PROCESS, each on a single line. The single-line
+# format is intentional so the output is easy to grep, pipe, and append to logs.
+# To pretty-print, pipe through jq (see "BEAUTIFYING" below).
+#
+# Each line looks like:
+#
+#   {"<comm>": {"PID": N, "Mem": "..", "Mem Peak": "..", "RSS": "..",
+#               "CPU%": "..", "NCPU%": ".."},
+#    "Total": {"CPU Power": "..", "GPU Power": "..", "GPU%": ".."}}
+#
+# Fields:
+#   <comm>      Last 80 chars of the process command path (the JSON key).
+#   PID         Process id.
+#   Mem         Physical footprint (vmmap). What Activity Monitor calls
+#               "Memory". The number you should trust for real RAM cost.
+#   Mem Peak    Peak physical footprint since the process started.
+#   RSS         Resident Set Size (ps -o rss), in MB. A cross-check metric;
+#               see "RSS vs Mem" below for why it can differ wildly.
+#   CPU%        Current %CPU (ps %cpu).
+#   NCPU%       Normalized %CPU (ps cpu) — divided across cores.
+#   Total       System-wide power, sampled ONCE per invocation:
+#     CPU Power   Package CPU power draw (powermetrics).
+#     GPU Power   GPU power draw (powermetrics).
+#     GPU%        GPU HW active residency (powermetrics).
+#
+# Note: the "Total" power block is system-wide (a single powermetrics sample),
+# not per-process, so it repeats identically on every process line.
+#
+# -----------------------------------------------------------------------------
+# RSS vs Mem — WHY THEY DISAGREE (and which to trust)
+# -----------------------------------------------------------------------------
+# These two numbers measure different things, and different inference engines
+# stress opposite ends of that difference:
+#
+#   RSS (ps -o rss)            Every physical RAM page mapped into the process,
+#                              INCLUDING shared libraries and clean, file-backed
+#                              pages (e.g. an mmap'd model file). EXCLUDES
+#                              compressed/swapped memory.
+#
+#   Mem / Mem Peak (vmmap      Apple's "physical footprint" — the memory the
+#   "Physical footprint")      process is actually CHARGED for (Activity
+#                              Monitor's "Memory" column). EXCLUDES clean
+#                              reclaimable file-backed pages; INCLUDES dirty
+#                              pages, compressed memory, and IOKit/GPU (Metal)
+#                              allocations.
+#
+# Real data from this tool:
+#
+#   llama-server   ->  "Mem": "845.5M", "RSS": "3098.3 MB"   (RSS >> Mem)
+#   mlx_lm python  ->  "Mem": "7.4G",   "RSS": "1789.4 MB"   (Mem >> RSS)
+#
+# Why each diverges:
+#
+#   * llama.cpp (llama-server) mmaps the GGUF model by default. Those model
+#     pages are clean and file-backed, so they count fully in RSS (they sit in
+#     RAM) but barely in physical footprint (the OS can drop them for free, so
+#     the process isn't billed). The gap IS the mmap'd weights.
+#
+#   * MLX (mlx_lm) uses Apple unified memory: tensors live in Metal/IOKit GPU
+#     buffers. Those allocations are charged to physical footprint (watch
+#     "Mem Peak" jump during inference) but the GPU-wired/IOKit memory is not
+#     counted in the traditional ps resident set, so RSS looks small.
+#     Compressed pages widen the gap further.
+#
+# Takeaway: trust "Mem" (physical footprint) for real RAM cost on both engines.
+# RSS over-reports for mmap-based loaders (llama.cpp) and under-reports for
+# GPU/unified-memory engines (MLX). Seeing both side by side is a quick way to
+# tell whether a process is mmap-heavy or GPU-allocation-heavy at a glance.
+#
+# -----------------------------------------------------------------------------
+# BEAUTIFYING THE OUTPUT (jq)
+# -----------------------------------------------------------------------------
+# The raw output is intentionally one line per process. Pipe through jq to
+# pretty-print:
+#
+#     mem-plus llama-server | jq .
+#
+# -----------------------------------------------------------------------------
+# WATCHING / REPEATING (no `watch` needed)
+# -----------------------------------------------------------------------------
+# A plain zsh loop re-runs it on an interval. Ctrl-C to stop:
+#
+#     while :; do mem-plus "llama-server|python" | jq .; sleep 10; done
+#
+# -----------------------------------------------------------------------------
+# REQUIREMENTS / NOTES
+# -----------------------------------------------------------------------------
+#   * macOS (uses vmmap, powermetrics, ps -o comm/rss).
+#   * powermetrics needs sudo; it is called once per invocation. You may be
+#     prompted for your password (or configure passwordless sudo for it).
+#   * jq is only needed if you want pretty output; the tool itself emits valid
+#     JSON without it.
+# =============================================================================
+
+if [ -z "$1" ]; then
+    echo "Usage: mem-plus <process-name-or-pattern>"
+    echo "Example: mem-plus mlx_lm.generate"
+    exit 1
+fi
+
+PATTERN="$1"
+
+# === Get system-wide power metrics ONCE ===
+printf "Sampling power metrics..." >&2
+power_data=$(sudo powermetrics --samplers cpu_power,gpu_power -i 300 -n 1 2>/dev/null)
+
+# Robust parsing
+cpu_power=$(echo "$power_data" | grep -E "CPU Power:" | head -1 | awk '{print $3 $4}')
+gpu_pct=$(echo "$power_data" | grep -E "GPU HW active residency" | awk '{print $5}' | tr -d '%')
+gpu_power=$(echo "$power_data" | grep -E "GPU Power:" | head -1 | awk '{print $3 $4}')
+
+printf " Done\n" >&2
+
+# === Process loop ===
+for pid in $(pgrep -f "$PATTERN"); do
+    # Get last 80 characters of full command path
+    full_comm=$(ps -o comm= -p $pid)
+    proc_name=${full_comm: -80}
+
+    # Memory
+    mem_data=$(vmmap --summary $pid 2>/dev/null)
+    mem=$(echo "$mem_data" | grep "Physical footprint:" | awk '{print $3}')
+    mem_peak=$(echo "$mem_data" | grep "Physical footprint (peak):" | awk '{print $4}')
+
+    # RSS (resident set size) for comparison, like mem() in zshrc
+    rss=$(ps -o rss= -p $pid | awk '{printf "%.1f MB", $1/1024}')
+
+    # CPU
+    cpu_data=$(ps -o %cpu=,cpu= -p $pid)
+    cpu_pct=$(echo "$cpu_data" | awk '{printf "%.1f", $1}')
+    ncpu_pct=$(echo "$cpu_data" | awk '{printf "%.1f", $2}')
+
+    # Valid JSON output (one line per process — pipe to `jq .` to beautify)
+    cat <<EOF
+{"$proc_name": {"PID": $pid, "Mem": "${mem:-N/A}", "Mem Peak": "${mem_peak:-N/A}", "RSS": "${rss:-N/A}", "CPU%": "${cpu_pct}%", "NCPU%": "${ncpu_pct}%"}, "Total": {"CPU Power": "${cpu_power:-N/A}", "GPU Power": "${gpu_power:-N/A}", "GPU%": "${gpu_pct:-N/A}%"}}
+EOF
+
+done
