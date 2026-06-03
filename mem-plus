@@ -21,7 +21,7 @@
 # Each line looks like:
 #
 #   {"<comm>": {"PID": N, "Mem": "..", "Mem Peak": "..", "RSS": "..",
-#               "CPU%": "..", "NCPU%": ".."},
+#               "CPU%": ".."},
 #    "Total": {"CPU Power": "..", "GPU Power": "..", "GPU%": ".."}}
 #
 # Fields:
@@ -32,8 +32,9 @@
 #   Mem Peak    Peak physical footprint since the process started.
 #   RSS         Resident Set Size (ps -o rss), in MB. A cross-check metric;
 #               see "RSS vs Mem" below for why it can differ wildly.
-#   CPU%        Current %CPU (ps %cpu).
-#   NCPU%       Normalized %CPU (ps cpu) — divided across cores.
+#   CPU%        Instantaneous %CPU, htop-style. Measured with `top -l 2 -s 1`
+#               and reading the SECOND sample, which is a delta over a 1s
+#               interval. (See "WHY CPU% IS MEASURED THIS WAY" below.)
 #   Total       System-wide power, sampled ONCE per invocation:
 #     CPU Power   Package CPU power draw (powermetrics).
 #     GPU Power   GPU power draw (powermetrics).
@@ -84,6 +85,32 @@
 # tell whether a process is mmap-heavy or GPU-allocation-heavy at a glance.
 #
 # -----------------------------------------------------------------------------
+# WHY CPU% IS MEASURED THIS WAY (and not with `ps`)
+# -----------------------------------------------------------------------------
+# Earlier versions read `ps -o %cpu` (and `ps -o cpu`). Both are wrong for a
+# live "what is it doing right now" snapshot:
+#
+#   * `ps -o %cpu` is, per `man ps`, "a decaying average over up to a minute".
+#     On Darwin it behaves essentially as CPU-time / elapsed-time for
+#     long-lived processes. A server up for hours that is mostly idle with
+#     occasional bursts averages to ~0% — the 15-30% bursts you see in htop
+#     get smeared across the whole process lifetime. That is why CPU% read
+#     0.0% even while htop showed real load.
+#
+#   * `ps -o cpu` is "short-term CPU usage factor (for scheduling)" — the
+#     kernel's raw scheduler-decay counter (p_estcpu), NOT a percentage. It is
+#     near 0 almost always. (This was the old, misnamed "NCPU%" field; removed.)
+#
+# An accurate instantaneous %CPU requires sampling cumulative CPU time TWICE
+# over an interval and dividing the delta by wall-clock time — exactly what
+# htop/top do and what a single `ps` snapshot cannot. So this tool runs ONE
+# `top -l 2 -s 1` for all matched PIDs at once and reads the SECOND sample
+# (the first sample is cumulative; only the second is a true 1s delta).
+#
+# Cost: this adds ~1 second of latency per invocation (top must wait one
+# interval to measure a delta). That is the unavoidable price of a real CPU%.
+#
+# -----------------------------------------------------------------------------
 # BEAUTIFYING THE OUTPUT (jq)
 # -----------------------------------------------------------------------------
 # The raw output is intentionally one line per process. Pipe through jq to
@@ -127,8 +154,24 @@ gpu_power=$(echo "$power_data" | grep -E "GPU Power:" | head -1 | awk '{print $3
 
 printf " Done\n" >&2
 
+# === Collect matching PIDs ===
+pids=($(pgrep -f "$PATTERN"))
+[ ${#pids[@]} -eq 0 ] && exit 0
+
+# === Instantaneous %CPU for ALL pids in one shot (htop-style) ===
+# `top -l 2 -s 1` emits two samples; the SECOND is a true 1s delta. We keep the
+# last value seen per pid (= second sample). See header docs for the rationale.
+pid_args=()
+for p in $pids; do pid_args+=(-pid $p); done
+top_data=$(top -l 2 -s 1 $pid_args -stats pid,cpu 2>/dev/null)
+
+typeset -A cpu_map
+while read -r tp tc; do
+    cpu_map[$tp]=$tc
+done < <(echo "$top_data" | awk '$1 ~ /^[0-9]+$/ {print $1, $2}')
+
 # === Process loop ===
-for pid in $(pgrep -f "$PATTERN"); do
+for pid in $pids; do
     # Get last 80 characters of full command path
     full_comm=$(ps -o comm= -p $pid)
     proc_name=${full_comm: -80}
@@ -141,14 +184,12 @@ for pid in $(pgrep -f "$PATTERN"); do
     # RSS (resident set size) for comparison, like mem() in zshrc
     rss=$(ps -o rss= -p $pid | awk '{printf "%.1f MB", $1/1024}')
 
-    # CPU
-    cpu_data=$(ps -o %cpu=,cpu= -p $pid)
-    cpu_pct=$(echo "$cpu_data" | awk '{printf "%.1f", $1}')
-    ncpu_pct=$(echo "$cpu_data" | awk '{printf "%.1f", $2}')
+    # CPU — instantaneous, from the top -l 2 second-sample map above
+    cpu_pct=$(printf "%.1f" "${cpu_map[$pid]:-0}")
 
     # Valid JSON output (one line per process — pipe to `jq .` to beautify)
     cat <<EOF
-{"$proc_name": {"PID": $pid, "Mem": "${mem:-N/A}", "Mem Peak": "${mem_peak:-N/A}", "RSS": "${rss:-N/A}", "CPU%": "${cpu_pct}%", "NCPU%": "${ncpu_pct}%"}, "Total": {"CPU Power": "${cpu_power:-N/A}", "GPU Power": "${gpu_power:-N/A}", "GPU%": "${gpu_pct:-N/A}%"}}
+{"$proc_name": {"PID": $pid, "Mem": "${mem:-N/A}", "Mem Peak": "${mem_peak:-N/A}", "RSS": "${rss:-N/A}", "CPU%": "${cpu_pct}%"}, "Total": {"CPU Power": "${cpu_power:-N/A}", "GPU Power": "${gpu_power:-N/A}", "GPU%": "${gpu_pct:-N/A}%"}}
 EOF
 
 done
