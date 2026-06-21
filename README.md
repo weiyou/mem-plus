@@ -4,6 +4,13 @@
 
 A macOS utility that prints a compact, machine-readable snapshot of memory, CPU, and power usage for running processes — handy for watching local inference servers like llama.cpp and MLX.
 
+## Setup
+The `mem-plus` script runs as-is. To get the `Mem BW` / `Mem BW Max` fields, compile the bundled `membw` helper once (see "Memory Bandwidth" for why it exists):
+```bash
+clang -O2 -framework CoreFoundation -o membw membw.c
+```
+Without it, every other field still works and `Mem BW` reads `N/A GB/s`. Both `mem-plus` and `membw` use `sudo` (powermetrics and IOReport are privileged).
+
 ## Usage
 ```
 mem-plus <process-name-or-pattern>
@@ -101,7 +108,7 @@ So mem-plus ships a tiny companion, **`membw.c`**, that you compile once:
 ```bash
 clang -O2 -framework CoreFoundation -o membw membw.c
 ```
-It `dlopen`s `libIOReport.dylib` and reads **only** the aggregate AMC `DCS RD` / `DCS WR` byte counters over a 1-second interval, prints combined read+write GB/s, and exits. mem-plus calls it (via `sudo`) once per invocation to fill `Mem BW`; `Mem BW Max` is then a running maximum persisted in `/tmp/mem-plus-membw-max`.
+It `dlopen`s `libIOReport.dylib` and reads **only** the aggregate AMC `DCS RD` / `DCS WR` byte counters over a 1-second interval, prints combined read+write GB/s, and exits. mem-plus calls it (via `sudo`) once per invocation to fill `Mem BW`; `Mem BW Max` is then a time-decaying peak derived from it (see "Mem BW Max — the Decaying Peak" below).
 
 Why a bespoke helper instead of shelling out to mactop: a full mactop sample also opens the NVMe/disk IOKit user client, which holds it exclusively and **locks out `smartctl`** for the duration of the sample. `membw` touches *only* the memory-controller counters and never opens a disk user client, so it does not interfere with `smartctl` (verified: smartctl reads all disks fine while `membw` runs in a tight loop).
 
@@ -135,6 +142,7 @@ A plain zsh loop re-runs it on an interval. Ctrl-C to stop:
 ```bash
 while :; do mem-plus "llama-server|python" | jq .; sleep 10; done
 ```
+Running it on a short interval like this is also what makes `Mem BW Max` behave as a rolling peak — keep the loop interval well under `MEMPLUS_BW_WINDOW_SEC` so a busy workload keeps refreshing the mark before it decays.
 
 ## Requirements / Notes
 - macOS on Apple Silicon (uses vmmap, powermetrics, ps -o comm/rss, and IOReport for bandwidth).
