@@ -195,14 +195,44 @@ if [ -x "$membw_bin" ]; then
 fi
 printf " Done\n" >&2
 
-# "Mem BW Max" is a session-running maximum, persisted in /tmp so it survives
-# across repeated mem-plus invocations (until the file is removed or reboot
-# clears /tmp). Delete the file to reset the high-water mark.
+# "Mem BW Max" is a decaying high-water mark, persisted in /tmp. It is the
+# highest Mem BW seen, but it FORGETS a peak that has not been matched or beaten
+# for MEMPLUS_BW_WINDOW_SEC seconds (default 900). This gives a "quasi rolling
+# window": because mem-plus is short-lived and typically run on a short interval
+# (e.g. every 10s), the displayed max stays close to the highest value seen in
+# the trailing window without storing any timestamped history.
+#
+# The trick is in WHEN we touch the file. The file's mtime marks the moment the
+# current max was last set/raised — NOT the last invocation — because we only
+# rewrite the file on a new high or on expiry. Lower samples leave it untouched,
+# so its mtime (and thus the decay clock) is preserved. Steps:
+#   * file missing or older than the window  -> stale: reseed max := current
+#   * current > stored max                   -> new high: max := current
+#   * otherwise                              -> leave file alone (preserve mtime)
+# On decay we reseed from the current sample (not the second-highest in-window
+# value), so the max may briefly under-report right after a peak expires, then
+# recover as fresh samples arrive. That is the accepted cost of skipping any
+# timestamp bookkeeping. Delete the file to reset immediately.
 membw_max_file="/tmp/mem-plus-membw-max"
+membw_window=${MEMPLUS_BW_WINDOW_SEC:-900}
 prev_max=$(cat "$membw_max_file" 2>/dev/null)
-membw_max=$(awk -v cur="${membw:-0}" -v prev="${prev_max:-0}" \
-    'BEGIN{m=(cur+0>prev+0)?cur+0:prev+0; printf "%.1f", m}')
-echo "$membw_max" > "$membw_max_file" 2>/dev/null
+file_mtime=$(stat -f %m "$membw_max_file" 2>/dev/null)
+now=$(date +%s)
+cur=${membw:-0}
+
+if [ -z "$file_mtime" ] || [ $((now - file_mtime)) -ge "$membw_window" ]; then
+    # Missing or stale -> reseed the high-water mark from the current sample.
+    membw_max=$(awk -v c="$cur" 'BEGIN{printf "%.1f", c}')
+    echo "$membw_max" > "$membw_max_file" 2>/dev/null
+elif awk -v c="$cur" -v p="${prev_max:-0}" 'BEGIN{exit !(c+0 > p+0)}'; then
+    # New high -> raise the mark and restart the decay clock (mtime bumps).
+    membw_max=$(awk -v c="$cur" 'BEGIN{printf "%.1f", c}')
+    echo "$membw_max" > "$membw_max_file" 2>/dev/null
+else
+    # Current is not higher and not stale -> keep the stored max, DON'T write
+    # (preserving mtime so the decay clock keeps counting from the last peak).
+    membw_max=$(awk -v p="${prev_max:-0}" 'BEGIN{printf "%.1f", p}')
+fi
 
 # === Collect matching PIDs ===
 pids=($(pgrep -f "$PATTERN"))

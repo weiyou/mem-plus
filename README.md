@@ -59,7 +59,7 @@ Each line looks like:
   - `GPU Power`: GPU power draw (powermetrics).
   - `GPU%`: GPU HW active residency (powermetrics).
   - `Mem BW`: DRAM read+write bandwidth in GB/s, measured over a 1s interval (`membw` helper — see "Memory Bandwidth" below).
-  - `Mem BW Max`: Session high-water mark for `Mem BW` — the highest value seen across repeated runs. Persisted in `/tmp/mem-plus-membw-max`; delete that file to reset it.
+  - `Mem BW Max`: Decaying high-water mark for `Mem BW` — the highest value seen, but it *forgets* a peak that hasn't been matched or beaten for `MEMPLUS_BW_WINDOW_SEC` seconds (default 900). Persisted in `/tmp/mem-plus-membw-max`; delete that file to reset it. See "Mem BW Max — the Decaying Peak" below.
 
 Note: the "Total" block is system-wide (a single sample), not per-process, so it repeats identically on every process line.
 
@@ -108,6 +108,21 @@ Why a bespoke helper instead of shelling out to mactop: a full mactop sample als
 Accuracy tracks mactop's `dram_bw_combined_gbs` within a few percent under load (no scale factor applied; small gaps are just non-overlapping sample windows).
 
 If the `membw` binary isn't built/present, `Mem BW` reads `N/A GB/s` and everything else still works.
+
+## Mem BW Max — the Decaying Peak
+`Mem BW Max` is a high-water mark with a **time-decay**, so a one-off spike from long ago doesn't dominate forever. It is the highest `Mem BW` observed, but it forgets a peak that has not been matched or beaten for `MEMPLUS_BW_WINDOW_SEC` seconds (default **900**):
+```bash
+MEMPLUS_BW_WINDOW_SEC=300 mem-plus llama-server   # 5-minute decay window
+```
+
+How it works — the state is a single number in `/tmp/mem-plus-membw-max`, and the file's **mtime marks when that peak was last set**. Each run:
+- file missing or older than the window → **reseed** the max to the current sample;
+- current `Mem BW` > stored max → **new high**, rewrite (restarting the decay clock);
+- otherwise → leave the file (and its mtime) **untouched**, so the decay clock keeps counting from the last peak.
+
+Because mem-plus is short-lived and usually run on a short interval (e.g. `while :; do mem-plus … ; sleep 10; done`), this acts as a **quasi rolling window**: the displayed max tracks the highest value in roughly the trailing `MEMPLUS_BW_WINDOW_SEC` seconds — without storing any timestamped history.
+
+Caveat: on decay it reseeds from the *current* sample, not the second-highest value still inside the window. So immediately after a peak expires the max can briefly under-report, then recover as fresh samples arrive. That is the deliberate trade for skipping all timestamp bookkeeping; it never over-reports. Delete the file to reset the mark immediately.
 
 ## Beautifying the Output (jq)
 The raw output is intentionally one line per process. Pipe through jq to pretty-print:
