@@ -39,7 +39,9 @@ Each line looks like:
   "Total": {
     "CPU Power": "5200mW",
     "GPU Power": "8100mW",
-    "GPU%": "62.3%"
+    "GPU%": "62.3%",
+    "Mem BW": "17.4 GB/s",
+    "Mem BW Max": "42.1 GB/s"
   }
 }
 ```
@@ -52,12 +54,14 @@ Each line looks like:
 - `RSS`: Resident Set Size (ps -o rss), in MB. A cross-check metric; see "RSS vs Mem" below for why it can differ wildly.
 - `CPU%`: Instantaneous %CPU, htop-style. Measured with `top -l 2 -s 1` and reading the SECOND sample, which is a delta over a 1s interval. Sums across cores, so a process pinning N threads can exceed 100%. (See "Why CPU% Is Measured This Way" below.)
 - `NCPU%`: CPU% normalized by logical core count (hw.ncpu): CPU% / ncpu. Caps at ~100% = the process is using the entire machine.
-- `Total`: System-wide power, sampled ONCE per invocation:
+- `Total`: System-wide metrics, sampled ONCE per invocation:
   - `CPU Power`: Package CPU power draw (powermetrics).
   - `GPU Power`: GPU power draw (powermetrics).
   - `GPU%`: GPU HW active residency (powermetrics).
+  - `Mem BW`: DRAM read+write bandwidth in GB/s, measured over a 1s interval (`membw` helper — see "Memory Bandwidth" below).
+  - `Mem BW Max`: Session high-water mark for `Mem BW` — the highest value seen across repeated runs. Persisted in `/tmp/mem-plus-membw-max`; delete that file to reset it.
 
-Note: the "Total" power block is system-wide (a single powermetrics sample), not per-process, so it repeats identically on every process line.
+Note: the "Total" block is system-wide (a single sample), not per-process, so it repeats identically on every process line.
 
 ## RSS vs Mem — Why They Disagree (and Which to Trust)
 These two numbers measure different things, and different inference engines stress opposite ends of that difference:
@@ -90,6 +94,21 @@ An accurate instantaneous %CPU requires sampling cumulative CPU time TWICE over 
 
 Cost: This adds ~1 second of latency per invocation (top must wait one interval to measure a delta). That is the unavoidable price of a real CPU%.
 
+## Memory Bandwidth (the `membw` helper)
+powermetrics on Apple Silicon exposes **no** memory-bandwidth sampler (its samplers are only tasks, battery, network, disk, interrupts, cpu_power, thermal, sfi, gpu_power, ane_power). DRAM bandwidth lives only in the private **IOReport** framework — the same source asitop/macmon/mactop read.
+
+So mem-plus ships a tiny companion, **`membw.c`**, that you compile once:
+```bash
+clang -O2 -framework CoreFoundation -o membw membw.c
+```
+It `dlopen`s `libIOReport.dylib` and reads **only** the aggregate AMC `DCS RD` / `DCS WR` byte counters over a 1-second interval, prints combined read+write GB/s, and exits. mem-plus calls it (via `sudo`) once per invocation to fill `Mem BW`; `Mem BW Max` is then a running maximum persisted in `/tmp/mem-plus-membw-max`.
+
+Why a bespoke helper instead of shelling out to mactop: a full mactop sample also opens the NVMe/disk IOKit user client, which holds it exclusively and **locks out `smartctl`** for the duration of the sample. `membw` touches *only* the memory-controller counters and never opens a disk user client, so it does not interfere with `smartctl` (verified: smartctl reads all disks fine while `membw` runs in a tight loop).
+
+Accuracy tracks mactop's `dram_bw_combined_gbs` within a few percent under load (no scale factor applied; small gaps are just non-overlapping sample windows).
+
+If the `membw` binary isn't built/present, `Mem BW` reads `N/A GB/s` and everything else still works.
+
 ## Beautifying the Output (jq)
 The raw output is intentionally one line per process. Pipe through jq to pretty-print:
 ```bash
@@ -103,6 +122,7 @@ while :; do mem-plus "llama-server|python" | jq .; sleep 10; done
 ```
 
 ## Requirements / Notes
-- macOS (uses vmmap, powermetrics, ps -o comm/rss).
+- macOS on Apple Silicon (uses vmmap, powermetrics, ps -o comm/rss, and IOReport for bandwidth).
 - powermetrics needs sudo; it is called once per invocation. You may be prompted for your password (or configure passwordless sudo for it).
+- The `Mem BW` fields require the bundled `membw` helper, compiled once with `clang -O2 -framework CoreFoundation -o membw membw.c`. It also needs sudo (IOReport access). The compiled binary is gitignored — only the `membw.c` source is tracked. If it's missing, `Mem BW` reads `N/A GB/s`.
 - jq is only needed if you want pretty output; the tool itself emits valid JSON without it.
