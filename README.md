@@ -8,9 +8,10 @@ A macOS utility that prints a compact, machine-readable snapshot of memory, CPU,
 The `mem-plus` script runs as-is. Compile the bundled helpers once:
 ```bash
 clang -O2 -o memfoot memfoot.c
+clang -O2 -o memsys memsys.c
 clang -O2 -framework CoreFoundation -o membw membw.c
 ```
-Without `memfoot`, `Mem` / `Mem Peak` read `N/A`. Without `membw`, `Mem BW` reads `N/A GB/s`. `memfoot` uses `proc_pid_rusage` (same source as Activity Monitor, no VM region walk). `membw` and powermetrics need `sudo`.
+Without `memfoot`, `Mem` / `Mem Peak` read `N/A`. Without `memsys`, `Mem Used` / `Mem Pressure` / `Mem Free%` read `N/A`. Without `membw`, `Mem BW` reads `N/A GB/s`. `membw` and powermetrics need `sudo`.
 
 ## Usage
 ```
@@ -49,7 +50,10 @@ Each line looks like:
     "GPU Power": "8100mW",
     "GPU%": "62.3%",
     "Mem BW": "17.4 GB/s",
-    "Mem BW Max": "42.1 GB/s"
+    "Mem BW Max": "42.1 GB/s",
+    "Mem Used": "23.21 GB",
+    "Mem Pressure": "Warn",
+    "Mem Free%": "3.3%"
   }
 }
 ```
@@ -68,6 +72,9 @@ Each line looks like:
   - `GPU%`: GPU HW active residency (powermetrics).
   - `Mem BW`: DRAM read+write bandwidth in GB/s, measured over a 1s interval (`membw` helper — see "Memory Bandwidth" below).
   - `Mem BW Max`: Decaying high-water mark for `Mem BW` — the highest value seen, but it *forgets* a peak that hasn't been matched or beaten for `MEMPLUS_BW_WINDOW_SEC` seconds (default 900). Persisted in `/tmp/mem-plus-membw-max`; delete that file to reset it. See "Mem BW Max — the Decaying Peak" below.
+  - `Mem Used`: System-wide RAM used — Activity Monitor Memory tab bottom line (`physical RAM − free pages`).
+  - `Mem Pressure`: `Normal`, `Warn`, or `Critical` — same sysctl Activity Monitor's Memory Pressure graph uses (`kern.memorystatus_vm_pressure_level`).
+  - `Mem Free%`: Percent of physical RAM that is free (same basis as `memory_pressure(1)`).
 
 Note: the "Total" block is system-wide (a single sample), not per-process, so it repeats identically on every process line.
 
@@ -115,6 +122,19 @@ clang -O2 -o memfoot memfoot.c
 
 If the `memfoot` binary isn't built/present, `Mem` / `Mem Peak` read `N/A` and everything else still works.
 
+## System Memory (the `memsys` helper)
+Activity Monitor's Memory tab shows two headline figures mem-plus now mirrors in `Total`:
+
+- **Memory Used** → `Mem Used` — `(hw.memsize / page_size − free_pages) × page_size`, formatted in GB. This is *machine-wide* RAM in use, not any single process's footprint.
+- **Memory Pressure** → `Mem Pressure` + `Mem Free%` — from `host_statistics64` free-page count and `kern.memorystatus_vm_pressure_level` (`0` Normal, `1` Warn, `2` Critical).
+
+Build once:
+```bash
+clang -O2 -o memsys memsys.c
+```
+
+No `sudo` required. If the binary is missing, those three fields read `N/A`.
+
 ## Memory Bandwidth (the `membw` helper)
 powermetrics on Apple Silicon exposes **no** memory-bandwidth sampler (its samplers are only tasks, battery, network, disk, interrupts, cpu_power, thermal, sfi, gpu_power, ane_power). DRAM bandwidth lives only in the private **IOReport** framework — the same source asitop/macmon/mactop read.
 
@@ -159,8 +179,9 @@ while :; do mem-plus "llama-server|python" | jq .; sleep 10; done
 Running it on a short interval like this is also what makes `Mem BW Max` behave as a rolling peak — keep the loop interval well under `MEMPLUS_BW_WINDOW_SEC` so a busy workload keeps refreshing the mark before it decays.
 
 ## Requirements / Notes
-- macOS on Apple Silicon (uses `memfoot`, powermetrics, ps -o comm/rss, and IOReport for bandwidth).
+- macOS on Apple Silicon (uses `memfoot`, `memsys`, powermetrics, ps -o comm/rss, and IOReport for bandwidth).
 - powermetrics needs sudo; it is called once per invocation. You may be prompted for your password (or configure passwordless sudo for it).
 - `Mem` / `Mem Peak` require the bundled `memfoot` helper (`clang -O2 -o memfoot memfoot.c`). It reads `phys_footprint` via `proc_pid_rusage` and does not walk VM regions like `vmmap`, so it won't hitch live apps.
+- `Mem Used` / `Mem Pressure` / `Mem Free%` require `memsys` (`clang -O2 -o memsys memsys.c`).
 - The `Mem BW` fields require the bundled `membw` helper, compiled once with `clang -O2 -framework CoreFoundation -o membw membw.c`. It also needs sudo (IOReport access). The compiled binaries are gitignored — only the `.c` sources are tracked. If missing, those fields read `N/A`.
 - jq is only needed if you want pretty output; the tool itself emits valid JSON without it.

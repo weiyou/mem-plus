@@ -23,7 +23,8 @@
 #   {"<comm>": {"PID": N, "Mem": "..", "Mem Peak": "..", "RSS": "..",
 #               "CPU%": "..", "NCPU%": ".."},
 #    "Total": {"CPU Power": "..", "GPU Power": "..", "GPU%": "..",
-#              "Mem BW": "..", "Mem BW Max": ".."}}
+#              "Mem BW": "..", "Mem BW Max": "..",
+#              "Mem Used": "..", "Mem Pressure": "..", "Mem Free%": ".."}}
 #
 # Fields:
 #   <comm>      Last 80 chars of the process command path (the JSON key).
@@ -47,6 +48,12 @@
 #     Mem BW Max  Session high-water mark for Mem BW: the highest value seen
 #                 across repeated mem-plus runs. Persisted in
 #                 /tmp/mem-plus-membw-max; delete that file to reset it.
+#     Mem Used    System-wide RAM used (memsys helper). Activity Monitor Memory
+#                 tab bottom line — physical RAM minus free pages.
+#     Mem Pressure System memory pressure: Normal, Warn, or Critical (sysctl
+#                 kern.memorystatus_vm_pressure_level; AM's pressure graph).
+#     Mem Free%   Percent of physical RAM that is free (same basis as
+#                 memory_pressure(1)'s "System-wide memory free percentage").
 #
 # Note: the "Total" block is system-wide (a single sample), not per-process, so
 # it repeats identically on every process line.
@@ -70,6 +77,11 @@
 # numbers, no region walk. Use vmmap manually when you need per-region detail.
 # Build once:
 #     clang -O2 -o memfoot memfoot.c
+#
+# System Mem Used / Pressure / Free% come from memsys (memsys.c): host VM stats
+# plus kern.memorystatus_vm_pressure_level — the same headline figures as
+# Activity Monitor's Memory tab. Build once:
+#     clang -O2 -o memsys memsys.c
 #
 # -----------------------------------------------------------------------------
 # RSS vs Mem — WHY THEY DISAGREE (and which to trust)
@@ -165,6 +177,8 @@
 #     It reads phys_footprint via proc_pid_rusage (same source as Activity
 #     Monitor) and does not walk VM regions like vmmap, so it won't hitch mpv
 #     or other live workloads. If the memfoot binary is missing, Mem reads N/A.
+#   * Mem Used / Mem Pressure / Mem Free% come from `memsys` (memsys.c):
+#     clang -O2 -o memsys memsys.c — Activity Monitor's system-wide memory tab.
 #   * The "Mem BW" fields come from the bundled `membw` helper (membw.c), which
 #     must be compiled once: clang -O2 -framework CoreFoundation -o membw membw.c
 #     It also needs sudo (IOReport access) and is called once per invocation. If
@@ -214,6 +228,15 @@ if [ -x "$membw_bin" ]; then
     membw=$(awk -v v="$membw" 'BEGIN{if (v=="") exit 1; printf "%.1f", v}') || membw=""
 fi
 printf " Done\n" >&2
+
+# === System-wide memory used + pressure (Activity Monitor Memory tab) ===
+memsys_bin="${0:A:h}/memsys"
+mem_used=""; mem_pressure=""; mem_free_pct=""
+if [ -x "$memsys_bin" ]; then
+    read -r mem_used_gb mem_pressure mem_free_pct <<< "$("$memsys_bin" 2>/dev/null)"
+    mem_used="${mem_used_gb} GB"
+    mem_free_pct="${mem_free_pct}%"
+fi
 
 # "Mem BW Max" is a decaying high-water mark, persisted in /tmp. It is the
 # highest Mem BW seen, but it FORGETS a peak that has not been matched or beaten
@@ -300,7 +323,7 @@ for pid in $pids; do
 
     # Valid JSON output (one line per process — pipe to `jq .` to beautify)
     cat <<EOF
-{"$proc_name": {"PID": $pid, "Mem": "${mem:-N/A}", "Mem Peak": "${mem_peak:-N/A}", "RSS": "${rss:-N/A}", "CPU%": "${cpu_pct}%", "NCPU%": "${ncpu_pct}%"}, "Total": {"CPU Power": "${cpu_power:-N/A}", "GPU Power": "${gpu_power:-N/A}", "GPU%": "${gpu_pct:-N/A}%", "Mem BW": "${membw:-N/A} GB/s", "Mem BW Max": "${membw_max:-N/A} GB/s"}}
+{"$proc_name": {"PID": $pid, "Mem": "${mem:-N/A}", "Mem Peak": "${mem_peak:-N/A}", "RSS": "${rss:-N/A}", "CPU%": "${cpu_pct}%", "NCPU%": "${ncpu_pct}%"}, "Total": {"CPU Power": "${cpu_power:-N/A}", "GPU Power": "${gpu_power:-N/A}", "GPU%": "${gpu_pct:-N/A}%", "Mem BW": "${membw:-N/A} GB/s", "Mem BW Max": "${membw_max:-N/A} GB/s", "Mem Used": "${mem_used:-N/A}", "Mem Pressure": "${mem_pressure:-N/A}", "Mem Free%": "${mem_free_pct:-N/A}"}}
 EOF
 
 done
