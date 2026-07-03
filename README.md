@@ -51,9 +51,9 @@ Each line looks like:
     "GPU%": "62.3%",
     "Mem BW": "17.4 GB/s",
     "Mem BW Max": "42.1 GB/s",
-    "Mem Used": "23.21 GB",
-    "Mem Pressure": "Warn",
-    "Mem Free%": "3.3%"
+    "Mem Used": "8.61 GB",
+    "Mem Pressure": "Normal",
+    "Mem Free%": "80.0%"
   }
 }
 ```
@@ -72,9 +72,9 @@ Each line looks like:
   - `GPU%`: GPU HW active residency (powermetrics).
   - `Mem BW`: DRAM read+write bandwidth in GB/s, measured over a 1s interval (`membw` helper — see "Memory Bandwidth" below).
   - `Mem BW Max`: Decaying high-water mark for `Mem BW` — the highest value seen, but it *forgets* a peak that hasn't been matched or beaten for `MEMPLUS_BW_WINDOW_SEC` seconds (default 900). Persisted in `/tmp/mem-plus-membw-max`; delete that file to reset it. See "Mem BW Max — the Decaying Peak" below.
-  - `Mem Used`: System-wide RAM used — Activity Monitor Memory tab bottom line (`physical RAM − free pages`).
-  - `Mem Pressure`: `Normal`, `Warn`, or `Critical` — same sysctl Activity Monitor's Memory Pressure graph uses (`kern.memorystatus_vm_pressure_level`).
-  - `Mem Free%`: Percent of physical RAM that is free (same basis as `memory_pressure(1)`).
+  - `Mem Used`: System-wide RAM used — Activity Monitor's "Memory Used" (`App + Wired + Compressed`; cached files excluded).
+  - `Mem Pressure`: `Normal`, `Warn`, or `Critical` — derived from `memorystatus_get_level()` free % (Activity Monitor's pressure graph).
+  - `Mem Free%`: Percent of RAM available (same API as `memory_pressure(1)`'s "System-wide memory free percentage").
 
 Note: the "Total" block is system-wide (a single sample), not per-process, so it repeats identically on every process line.
 
@@ -125,8 +125,8 @@ If the `memfoot` binary isn't built/present, `Mem` / `Mem Peak` read `N/A` and e
 ## System Memory (the `memsys` helper)
 Activity Monitor's Memory tab shows two headline figures mem-plus now mirrors in `Total`:
 
-- **Memory Used** → `Mem Used` — `(hw.memsize / page_size − free_pages) × page_size`, formatted in GB. This is *machine-wide* RAM in use, not any single process's footprint.
-- **Memory Pressure** → `Mem Pressure` + `Mem Free%` — from `host_statistics64` free-page count and `kern.memorystatus_vm_pressure_level` (`0` Normal, `1` Warn, `2` Critical).
+- **Memory Used** → `Mem Used` — `(wire_count + internal_page_count) × page_size`, matching App + Wired + Compressed. Cached file memory is *not* included (AM lists that separately).
+- **Memory Pressure** → `Mem Pressure` + `Mem Free%` — from `memorystatus_get_level()` (the same call `memory_pressure(1)` uses). Pressure labels use Apple's documented thresholds: ≥ 60% free = Normal, ≥ 30% = Warn, else Critical. The `kern.memorystatus_vm_pressure_level` sysctl lags and is not used.
 
 Build once:
 ```bash

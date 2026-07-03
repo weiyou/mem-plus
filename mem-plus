@@ -49,10 +49,10 @@
 #                 across repeated mem-plus runs. Persisted in
 #                 /tmp/mem-plus-membw-max; delete that file to reset it.
 #     Mem Used    System-wide RAM used (memsys helper). Activity Monitor Memory
-#                 tab bottom line — physical RAM minus free pages.
-#     Mem Pressure System memory pressure: Normal, Warn, or Critical (sysctl
-#                 kern.memorystatus_vm_pressure_level; AM's pressure graph).
-#     Mem Free%   Percent of physical RAM that is free (same basis as
+#                 tab "Memory Used" (App + Wired + Compressed; excludes cache).
+#     Mem Pressure System memory pressure: Normal, Warn, or Critical — derived
+#                 from memorystatus_get_level() free % (AM's pressure graph).
+#     Mem Free%   Percent of RAM available (memorystatus_get_level; same as
 #                 memory_pressure(1)'s "System-wide memory free percentage").
 #
 # Note: the "Total" block is system-wide (a single sample), not per-process, so
@@ -78,9 +78,9 @@
 # Build once:
 #     clang -O2 -o memfoot memfoot.c
 #
-# System Mem Used / Pressure / Free% come from memsys (memsys.c): host VM stats
-# plus kern.memorystatus_vm_pressure_level — the same headline figures as
-# Activity Monitor's Memory tab. Build once:
+# System Mem Used / Pressure / Free% come from memsys (memsys.c): wire+internal
+# page counts for Memory Used, memorystatus_get_level() for free % / pressure.
+# Build once:
 #     clang -O2 -o memsys memsys.c
 #
 # -----------------------------------------------------------------------------

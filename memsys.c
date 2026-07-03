@@ -4,18 +4,19 @@
 //
 // Prints three fields on one line:
 //     <memory_used_GB> <pressure_label> <free_percent>
-// e.g. "23.21 Warn 3.3"
+// e.g. "8.61 Normal 80.0"
 //
-// Memory Used matches Activity Monitor's bottom-line "Memory Used":
-//     (hw.memsize / page_size - free_count) * page_size
-// i.e. physical RAM minus free pages. Cached file memory still counts as
-// "used" in this headline figure until reclaimed.
+// Memory Used matches Activity Monitor's "Memory Used" (App + Wired + Compressed):
+//     (wire_count + internal_page_count) * page_size
+// Cached file memory is excluded — it appears separately as "Cached Files" in AM.
 //
-// Memory Pressure comes from sysctl kern.memorystatus_vm_pressure_level
-// (same source Activity Monitor's Memory Pressure graph uses):
-//     0 = Normal, 1 = Warn, 2 = Critical
+// Free % comes from memorystatus_get_level() — the same API memory_pressure(1)
+// uses for "System-wide memory free percentage" (NOT raw free_count/total_pages).
 //
-// Free % is 100 * free_count / total_pages (same basis as memory_pressure(1)).
+// Memory Pressure is derived from that percent using the same thresholds Apple
+// documents for normal/warn/critical in memory_pressure(1):
+//     >= 60% free -> Normal, >= 30% -> Warn, else Critical.
+// Do NOT use kern.memorystatus_vm_pressure_level — it lags behind the graph.
 //
 // Build:
 //     clang -O2 -o memsys memsys.c
@@ -26,18 +27,17 @@
 
 #include <mach/mach.h>
 #include <mach/mach_host.h>
+#include <mach/mach_types.h>
 #include <stdio.h>
 #include <stdint.h>
-#include <sys/sysctl.h>
 #include <unistd.h>
 
-static const char *pressure_label(uint32_t level) {
-    switch (level) {
-    case 0: return "Normal";
-    case 1: return "Warn";
-    case 2: return "Critical";
-    default: return "Unknown";
-    }
+extern int memorystatus_get_level(user_addr_t level);
+
+static const char *pressure_from_percent(unsigned int pct) {
+    if (pct >= 60) return "Normal";
+    if (pct >= 30) return "Warn";
+    return "Critical";
 }
 
 int main(void) {
@@ -49,31 +49,17 @@ int main(void) {
         return 1;
     }
 
+    unsigned int free_pct = 0;
+    if (memorystatus_get_level((user_addr_t)&free_pct) != 0) {
+        fprintf(stderr, "memsys: memorystatus_get_level failed\n");
+        return 1;
+    }
+
     uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
-    uint64_t memsize = 0;
-    size_t memsize_sz = sizeof(memsize);
-    if (sysctlbyname("hw.memsize", &memsize, &memsize_sz, NULL, 0) != 0) {
-        fprintf(stderr, "memsys: hw.memsize sysctl failed\n");
-        return 1;
-    }
+    uint64_t used_pages = vm.wire_count + vm.internal_page_count;
+    double used_gb = (double)(used_pages * page) / (1024.0 * 1024.0 * 1024.0);
 
-    uint64_t total_pages = memsize / page;
-    if (total_pages == 0) {
-        fprintf(stderr, "memsys: invalid page count\n");
-        return 1;
-    }
-
-    uint64_t used_bytes = (total_pages - vm.free_count) * page;
-    double used_gb = (double)used_bytes / (1024.0 * 1024.0 * 1024.0);
-    double free_pct = 100.0 * (double)vm.free_count / (double)total_pages;
-
-    uint32_t pressure = 0;
-    size_t pressure_sz = sizeof(pressure);
-    if (sysctlbyname("kern.memorystatus_vm_pressure_level",
-                     &pressure, &pressure_sz, NULL, 0) != 0) {
-        pressure = 999;
-    }
-
-    printf("%.2f %s %.1f\n", used_gb, pressure_label(pressure), free_pct);
+    printf("%.2f %s %.1f\n", used_gb, pressure_from_percent(free_pct),
+           (double)free_pct);
     return 0;
 }
