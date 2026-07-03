@@ -28,7 +28,7 @@
 # Fields:
 #   <comm>      Last 80 chars of the process command path (the JSON key).
 #   PID         Process id.
-#   Mem         Physical footprint (vmmap). What Activity Monitor calls
+#   Mem         Physical footprint (memfoot helper). What Activity Monitor calls
 #               "Memory". The number you should trust for real RAM cost.
 #   Mem Peak    Peak physical footprint since the process started.
 #   RSS         Resident Set Size (ps -o rss), in MB. A cross-check metric;
@@ -62,6 +62,15 @@
 # full mactop sample can. Build once:
 #     clang -O2 -framework CoreFoundation -o membw membw.c
 #
+# Why Mem comes from memfoot, not vmmap: vmmap walks every VM region via
+# task_read_for_pid + mach_vm_region_recurse to recompute the same headline
+# phys_footprint that Activity Monitor shows. On processes with thousands of
+# regions (mpv, llama-server) that invasive sweep can hitch live playback.
+# memfoot reads the kernel ledger via proc_pid_rusage in one syscall — same
+# numbers, no region walk. Use vmmap manually when you need per-region detail.
+# Build once:
+#     clang -O2 -o memfoot memfoot.c
+#
 # -----------------------------------------------------------------------------
 # RSS vs Mem — WHY THEY DISAGREE (and which to trust)
 # -----------------------------------------------------------------------------
@@ -73,8 +82,8 @@
 #                              pages (e.g. an mmap'd model file). EXCLUDES
 #                              compressed/swapped memory.
 #
-#   Mem / Mem Peak (vmmap      Apple's "physical footprint" — the memory the
-#   "Physical footprint")      process is actually CHARGED for (Activity
+#   Mem / Mem Peak (memfoot /   Apple's "physical footprint" — the memory the
+#   proc_pid_rusage)           process is actually CHARGED for (Activity
 #                              Monitor's "Memory" column). EXCLUDES clean
 #                              reclaimable file-backed pages; INCLUDES dirty
 #                              pages, compressed memory, and IOKit/GPU (Metal)
@@ -148,9 +157,14 @@
 # -----------------------------------------------------------------------------
 # REQUIREMENTS / NOTES
 # -----------------------------------------------------------------------------
-#   * macOS (uses vmmap, powermetrics, ps -o comm/rss).
+#   * macOS (uses memfoot, powermetrics, ps -o comm/rss).
 #   * powermetrics needs sudo; it is called once per invocation. You may be
 #     prompted for your password (or configure passwordless sudo for it).
+#   * Mem / Mem Peak come from the bundled `memfoot` helper (memfoot.c), which
+#     must be compiled once: clang -O2 -o memfoot memfoot.c
+#     It reads phys_footprint via proc_pid_rusage (same source as Activity
+#     Monitor) and does not walk VM regions like vmmap, so it won't hitch mpv
+#     or other live workloads. If the memfoot binary is missing, Mem reads N/A.
 #   * The "Mem BW" fields come from the bundled `membw` helper (membw.c), which
 #     must be compiled once: clang -O2 -framework CoreFoundation -o membw membw.c
 #     It also needs sudo (IOReport access) and is called once per invocation. If
@@ -167,6 +181,12 @@ if [ -z "$1" ]; then
 fi
 
 PATTERN="$1"
+# === Memory bandwidth sampling interval (in seconds) ===
+# Default = 1.0 (1 second average)
+# Use shorter values (e.g. 0.1 or 0.15) for better peak resolution during
+# bursty workloads like MLX generation. Set via:
+#     MEMPLUS_BW_INTERVAL=0.1 mem-plus mlx_lm.generate
+bw_interval=${MEMPLUS_BW_INTERVAL:-0.2}
 
 # === Get system-wide power metrics ONCE ===
 printf "Sampling power metrics..." >&2
@@ -190,7 +210,7 @@ printf " Done\n" >&2
 membw_bin="${0:A:h}/membw"
 printf "Sampling memory bandwidth..." >&2
 if [ -x "$membw_bin" ]; then
-    membw=$(sudo "$membw_bin" 1 2>/dev/null)
+    membw=$(sudo "$membw_bin" "$bw_interval" 2>/dev/null)
     membw=$(awk -v v="$membw" 'BEGIN{if (v=="") exit 1; printf "%.1f", v}') || membw=""
 fi
 printf " Done\n" >&2
@@ -254,16 +274,20 @@ while read -r tp tc; do
     cpu_map[$tp]=$tc
 done < <(echo "$top_data" | awk '$1 ~ /^[0-9]+$/ {print $1, $2}')
 
+memfoot_bin="${0:A:h}/memfoot"
+
 # === Process loop ===
 for pid in $pids; do
     # Get last 80 characters of full command path
     full_comm=$(ps -o comm= -p $pid)
     proc_name=${full_comm: -80}
 
-    # Memory
-    mem_data=$(vmmap --summary $pid 2>/dev/null)
-    mem=$(echo "$mem_data" | grep "Physical footprint:" | awk '{print $3}')
-    mem_peak=$(echo "$mem_data" | grep "Physical footprint (peak):" | awk '{print $4}')
+    # Memory — phys_footprint via proc_pid_rusage (Activity Monitor's source).
+    # Unlike vmmap, this does not walk every VM region and won't hitch mpv.
+    mem=""; mem_peak=""
+    if [ -x "$memfoot_bin" ]; then
+        read -r mem mem_peak <<< "$("$memfoot_bin" "$pid" 2>/dev/null)"
+    fi
 
     # RSS (resident set size) for comparison, like mem() in zshrc
     rss=$(ps -o rss= -p $pid | awk '{printf "%.1f MB", $1/1024}')

@@ -5,11 +5,12 @@
 A macOS utility that prints a compact, machine-readable snapshot of memory, CPU, and power usage for running processes — handy for watching local inference servers like llama.cpp and MLX.
 
 ## Setup
-The `mem-plus` script runs as-is. To get the `Mem BW` / `Mem BW Max` fields, compile the bundled `membw` helper once (see "Memory Bandwidth" for why it exists):
+The `mem-plus` script runs as-is. Compile the bundled helpers once:
 ```bash
+clang -O2 -o memfoot memfoot.c
 clang -O2 -framework CoreFoundation -o membw membw.c
 ```
-Without it, every other field still works and `Mem BW` reads `N/A GB/s`. Both `mem-plus` and `membw` use `sudo` (powermetrics and IOReport are privileged).
+Without `memfoot`, `Mem` / `Mem Peak` read `N/A`. Without `membw`, `Mem BW` reads `N/A GB/s`. `memfoot` uses `proc_pid_rusage` (same source as Activity Monitor, no VM region walk). `membw` and powermetrics need `sudo`.
 
 ## Usage
 ```
@@ -56,7 +57,7 @@ Each line looks like:
 ## Fields Explanation
 - `<comm>`: Last 80 chars of the process command path (the JSON key).
 - `PID`: Process id.
-- `Mem`: Physical footprint (vmmap). What Activity Monitor calls "Memory". The number you should trust for real RAM cost.
+- `Mem`: Physical footprint (`memfoot` helper / `proc_pid_rusage`). What Activity Monitor calls "Memory". The number you should trust for real RAM cost.
 - `Mem Peak`: Peak physical footprint since the process started.
 - `RSS`: Resident Set Size (ps -o rss), in MB. A cross-check metric; see "RSS vs Mem" below for why it can differ wildly.
 - `CPU%`: Instantaneous %CPU, htop-style. Measured with `top -l 2 -s 1` and reading the SECOND sample, which is a delta over a 1s interval. Sums across cores, so a process pinning N threads can exceed 100%. (See "Why CPU% Is Measured This Way" below.)
@@ -75,7 +76,7 @@ These two numbers measure different things, and different inference engines stre
 
 - **RSS** (`ps -o rss`): Every physical RAM page mapped into the process, INCLUDING shared libraries and clean, file-backed pages (e.g. an mmap'd model file). EXCLUDES compressed/swapped memory.
 
-- **Mem** / **Mem Peak**: Apple's "physical footprint" — the memory the process is actually CHARGED for (Activity Monitor's "Memory" column). EXCLUDES clean reclaimable file-backed pages; INCLUDES dirty pages, compressed memory, and IOKit/GPU (Metal) allocations.
+- **Mem** / **Mem Peak**: Apple's "physical footprint" — the memory the process is actually CHARGED for (Activity Monitor's "Memory" column). Read via `memfoot` / `proc_pid_rusage`. EXCLUDES clean reclaimable file-backed pages; INCLUDES dirty pages, compressed memory, and IOKit/GPU (Metal) allocations.
 
 Real data from this tool:
 
@@ -100,6 +101,19 @@ Earlier versions read `ps -o %cpu` (and `ps -o cpu`). Both are wrong for a live 
 An accurate instantaneous %CPU requires sampling cumulative CPU time TWICE over an interval and dividing the delta by wall-clock time — exactly what htop/top do and what a single `ps` snapshot cannot. So this tool runs ONE `top -l 2 -s 1` for all matched PIDs at once and reads the SECOND sample (the first sample is cumulative; only the second is a true 1s delta).
 
 Cost: This adds ~1 second of latency per invocation (top must wait one interval to measure a delta). That is the unavoidable price of a real CPU%.
+
+## Physical Footprint (the `memfoot` helper)
+`Mem` and `Mem Peak` are Apple's **physical footprint** — the memory a process is actually charged for (Activity Monitor's "Memory" column). mem-plus reads it via the bundled **`memfoot.c`** helper:
+```bash
+clang -O2 -o memfoot memfoot.c
+```
+`memfoot` calls `proc_pid_rusage(3)` (`RUSAGE_INFO_V4`) and prints `ri_phys_footprint` + `ri_lifetime_max_phys_footprint`. That is the same kernel ledger Activity Monitor and `top`'s MEM column use: one syscall per process, no VM region walk.
+
+**Why not `vmmap`?** Earlier versions ran `vmmap --summary` per PID. Even the summary mode walks every mapped region via `task_read_for_pid` + `mach_vm_region_recurse` to recompute the same headline number. On processes with thousands of regions (mpv, llama-server) that sweep can hitch live playback for a fraction of a second — even though the displayed footprint is identical.
+
+**When you still want `vmmap`:** the invasive sweep is for *debugging*, not monitoring. `vmmap` (or `footprint -v`) gives per-region addresses, mapped file paths, dirty/resident/swapped breakdown, and category totals (`MALLOC`, `VM_ALLOCATE`, `IOAccelerator`, etc.) — useful for finding leaks or understanding *where* memory lives. Use those tools manually; mem-plus sticks to the lightweight ledger read so it can run in a tight loop without stalling apps.
+
+If the `memfoot` binary isn't built/present, `Mem` / `Mem Peak` read `N/A` and everything else still works.
 
 ## Memory Bandwidth (the `membw` helper)
 powermetrics on Apple Silicon exposes **no** memory-bandwidth sampler (its samplers are only tasks, battery, network, disk, interrupts, cpu_power, thermal, sfi, gpu_power, ane_power). DRAM bandwidth lives only in the private **IOReport** framework — the same source asitop/macmon/mactop read.
@@ -145,7 +159,8 @@ while :; do mem-plus "llama-server|python" | jq .; sleep 10; done
 Running it on a short interval like this is also what makes `Mem BW Max` behave as a rolling peak — keep the loop interval well under `MEMPLUS_BW_WINDOW_SEC` so a busy workload keeps refreshing the mark before it decays.
 
 ## Requirements / Notes
-- macOS on Apple Silicon (uses vmmap, powermetrics, ps -o comm/rss, and IOReport for bandwidth).
+- macOS on Apple Silicon (uses `memfoot`, powermetrics, ps -o comm/rss, and IOReport for bandwidth).
 - powermetrics needs sudo; it is called once per invocation. You may be prompted for your password (or configure passwordless sudo for it).
-- The `Mem BW` fields require the bundled `membw` helper, compiled once with `clang -O2 -framework CoreFoundation -o membw membw.c`. It also needs sudo (IOReport access). The compiled binary is gitignored — only the `membw.c` source is tracked. If it's missing, `Mem BW` reads `N/A GB/s`.
+- `Mem` / `Mem Peak` require the bundled `memfoot` helper (`clang -O2 -o memfoot memfoot.c`). It reads `phys_footprint` via `proc_pid_rusage` and does not walk VM regions like `vmmap`, so it won't hitch live apps.
+- The `Mem BW` fields require the bundled `membw` helper, compiled once with `clang -O2 -framework CoreFoundation -o membw membw.c`. It also needs sudo (IOReport access). The compiled binaries are gitignored — only the `.c` sources are tracked. If missing, those fields read `N/A`.
 - jq is only needed if you want pretty output; the tool itself emits valid JSON without it.
