@@ -22,6 +22,8 @@
 // Build:
 //     clang -O2 -o memsys memsys.c
 //
+// Units: Mem Used is 1024-based (GiB), labeled GB like Activity Monitor.
+//
 // Usage:
 //     memsys
 // =============================================================================

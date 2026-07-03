@@ -78,6 +78,17 @@ Each line looks like:
 
 Note: the "Total" block is system-wide (a single sample), not per-process, so it repeats identically on every process line.
 
+## Units (GB vs GiB)
+Memory **sizes** (`Mem`, `Mem Peak`, `Mem Used`, `RSS`) are computed with **1024-based divisors** (MiB/GiB per IEC). They are labeled **MB** / **GB** anyway — the same convention Activity Monitor, `top`, `vmmap`, and `footprint` use — so you can compare numbers directly without converting.
+
+| Field | Divisor | Label | Compare with |
+|-------|---------|-------|--------------|
+| `Mem`, `Mem Peak`, `Mem Used` | 1024³ | `G` / `GB` | Activity Monitor memory columns |
+| `RSS` | 1024² | `MB` | `ps` / AM (same basis) |
+| `Mem BW` | 10⁹ | `GB/s` | Throughput convention (`membw`, mactop); **not** 1024-based |
+
+We keep **GB** rather than **GiB** in the output so `Mem Used: 8.61 GB` lines up with Activity Monitor's **8.61 GB** — same value, same label. Bandwidth is the one exception: `GB/s` there means decimal gigabytes per second.
+
 ## RSS vs Mem — Why They Disagree (and Which to Trust)
 These two numbers measure different things, and different inference engines stress opposite ends of that difference:
 

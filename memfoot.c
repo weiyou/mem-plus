@@ -14,6 +14,8 @@
 // Build:
 //     clang -O2 -o memfoot memfoot.c
 //
+// Units: 1024-based (MiB/GiB), labeled M/G like Activity Monitor.
+//
 // Usage:
 //     memfoot <pid>     # prints: "<footprint> <peak>"  (e.g. "729.0M 1.1G")
 // =============================================================================

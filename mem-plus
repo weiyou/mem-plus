@@ -58,6 +58,10 @@
 # Note: the "Total" block is system-wide (a single sample), not per-process, so
 # it repeats identically on every process line.
 #
+# Units: memory sizes (Mem, Mem Peak, Mem Used, RSS) use 1024-based divisors
+# (MiB/GiB) but are labeled MB/GB like Activity Monitor. Mem BW uses decimal
+# 10^9 bytes/s (GB/s) — the throughput convention, not 1024-based.
+#
 # Why Mem BW comes from a bundled helper, not powermetrics: powermetrics on
 # Apple Silicon exposes no memory-bandwidth sampler (its samplers are only
 # tasks, battery, network, disk, interrupts, cpu_power, thermal, sfi, gpu_power,
