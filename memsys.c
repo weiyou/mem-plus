@@ -7,7 +7,8 @@
 // e.g. "8.61 Normal 80.0"
 //
 // Memory Used matches Activity Monitor's "Memory Used" (App + Wired + Compressed):
-//     (wire_count + internal_page_count) * page_size
+//     (wire_count + internal_page_count + compressor_page_count) * page_size
+// internal ≈ App Memory, wire_count = Wired, compressor_page_count = Compressed.
 // Cached file memory is excluded — it appears separately as "Cached Files" in AM.
 //
 // Free % comes from memorystatus_get_level() — the same API memory_pressure(1)
@@ -56,7 +57,8 @@ int main(void) {
     }
 
     uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
-    uint64_t used_pages = vm.wire_count + vm.internal_page_count;
+    uint64_t used_pages = vm.wire_count + vm.internal_page_count
+                        + vm.compressor_page_count;
     double used_gb = (double)(used_pages * page) / (1024.0 * 1024.0 * 1024.0);
 
     printf("%.2f %s %.1f\n", used_gb, pressure_from_percent(free_pct),

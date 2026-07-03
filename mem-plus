@@ -49,7 +49,7 @@
 #                 across repeated mem-plus runs. Persisted in
 #                 /tmp/mem-plus-membw-max; delete that file to reset it.
 #     Mem Used    System-wide RAM used (memsys helper). Activity Monitor Memory
-#                 tab "Memory Used" (App + Wired + Compressed; excludes cache).
+#                 tab "Memory Used" (internal + wire + compressor; excludes cache).
 #     Mem Pressure System memory pressure: Normal, Warn, or Critical — derived
 #                 from memorystatus_get_level() free % (AM's pressure graph).
 #     Mem Free%   Percent of RAM available (memorystatus_get_level; same as
@@ -79,7 +79,7 @@
 #     clang -O2 -o memfoot memfoot.c
 #
 # System Mem Used / Pressure / Free% come from memsys (memsys.c): wire+internal
-# page counts for Memory Used, memorystatus_get_level() for free % / pressure.
+# +compressor for Memory Used, memorystatus_get_level() for free % / pressure.
 # Build once:
 #     clang -O2 -o memsys memsys.c
 #

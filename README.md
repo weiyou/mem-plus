@@ -125,7 +125,7 @@ If the `memfoot` binary isn't built/present, `Mem` / `Mem Peak` read `N/A` and e
 ## System Memory (the `memsys` helper)
 Activity Monitor's Memory tab shows two headline figures mem-plus now mirrors in `Total`:
 
-- **Memory Used** → `Mem Used` — `(wire_count + internal_page_count) × page_size`, matching App + Wired + Compressed. Cached file memory is *not* included (AM lists that separately).
+- **Memory Used** → `Mem Used` — `(wire_count + internal_page_count + compressor_page_count) × page_size`, matching App + Wired + Compressed (`internal` ≈ App, `compressor_page_count` = Compressed). Cached file memory is *not* included (AM lists that separately).
 - **Memory Pressure** → `Mem Pressure` + `Mem Free%` — from `memorystatus_get_level()` (the same call `memory_pressure(1)` uses). Pressure labels use Apple's documented thresholds: ≥ 60% free = Normal, ≥ 30% = Warn, else Critical. The `kern.memorystatus_vm_pressure_level` sysctl lags and is not used.
 
 Build once:
