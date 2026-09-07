@@ -66,11 +66,12 @@
 # Apple Silicon exposes no memory-bandwidth sampler (its samplers are only
 # tasks, battery, network, disk, interrupts, cpu_power, thermal, sfi, gpu_power,
 # ane_power). DRAM bandwidth lives only in the private IOReport framework. The
-# `membw` binary (compiled from membw.c that ships next to this script) reads
-# the aggregate AMC "DCS RD"/"DCS WR" byte counters over a 1s interval and
-# prints combined GB/s. It deliberately touches ONLY those counters — it never
-# opens a disk/NVMe IOKit user client, so it cannot lock out smartctl the way a
-# full mactop sample can. Build once:
+# `membw` binary (compiled from membw.c that ships next to this script) prints
+# combined DRAM GB/s. M1/M4: AMC "DCS RD"/"DCS WR" byte counters (sudo).
+# M4 Pro / M4 Max: AMC Stats will not subscribe, so PMP "DCS BW" AMCC
+# histograms are used instead (no sudo). It never opens a disk/NVMe IOKit
+# user client, so it cannot lock out smartctl the way a full mactop sample can.
+# Build once:
 #     clang -O2 -framework CoreFoundation -o membw membw.c
 #
 # Why Mem comes from memfoot, not vmmap: vmmap walks every VM region via
@@ -185,9 +186,9 @@
 #     clang -O2 -o memsys memsys.c — Activity Monitor's system-wide memory tab.
 #   * The "Mem BW" fields come from the bundled `membw` helper (membw.c), which
 #     must be compiled once: clang -O2 -framework CoreFoundation -o membw membw.c
-#     It also needs sudo (IOReport access) and is called once per invocation. If
-#     the membw binary is missing, "Mem BW" reads "N/A GB/s" and everything else
-#     still works.
+#     M4 Pro / M4 Max: no sudo (PMP histograms). M1/M4: falls back to sudo
+#     for AMC Stats. If the membw binary is missing, "Mem BW" reads
+#     "N/A GB/s" and everything else still works.
 #   * jq is only needed if you want pretty output; the tool itself emits valid
 #     JSON without it.
 # =============================================================================
@@ -218,17 +219,21 @@ gpu_power=$(echo "$power_data" | grep -E "GPU Power:" | head -1 | awk '{print $3
 printf " Done\n" >&2
 
 # === System-wide memory bandwidth via the bundled membw helper ===
-# powermetrics on Apple Silicon has NO bandwidth sampler (the only samplers are
-# tasks/battery/network/disk/interrupts/cpu_power/thermal/sfi/gpu_power/ane_power).
-# DRAM bandwidth lives only in the private IOReport framework. `membw` (built
-# from membw.c next to this script) reads JUST the aggregate AMC "DCS RD"/"DCS
-# WR" counters and prints combined read+write GB/s. It opens no disk/NVMe user
-# client, so it does NOT interfere with smartctl the way a full mactop sample
-# does. Build it once with: clang -O2 -framework CoreFoundation -o membw membw.c
+# powermetrics on Apple Silicon has NO bandwidth sampler. DRAM bandwidth lives
+# only in the private IOReport framework. `membw` (built from membw.c next to
+# this script) prints combined read+write GB/s. M1/M4: AMC "DCS RD"/"DCS WR"
+# byte counters (sudo). M4 Pro / M4 Max: AMC Stats will not subscribe, so PMP
+# "DCS BW"/AMCC histograms are used instead (no sudo). It opens no disk/NVMe
+# user client, so it does NOT interfere with smartctl. Build once:
+#     clang -O2 -framework CoreFoundation -o membw membw.c
 membw_bin="${0:A:h}/membw"
 printf "Sampling memory bandwidth..." >&2
 if [ -x "$membw_bin" ]; then
-    membw=$(sudo "$membw_bin" "$bw_interval" 2>/dev/null)
+    # PMP path (M4 Pro) works without sudo; fall back to sudo for AMC Stats.
+    membw=$("$membw_bin" "$bw_interval" 2>/dev/null)
+    if [ -z "$membw" ]; then
+        membw=$(sudo "$membw_bin" "$bw_interval" 2>/dev/null)
+    fi
     membw=$(awk -v v="$membw" 'BEGIN{if (v=="") exit 1; printf "%.1f", v}') || membw=""
 fi
 printf " Done\n" >&2

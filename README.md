@@ -11,7 +11,15 @@ clang -O2 -o memfoot memfoot.c
 clang -O2 -o memsys memsys.c
 clang -O2 -framework CoreFoundation -o membw membw.c
 ```
-Without `memfoot`, `Mem` / `Mem Peak` read `N/A`. Without `memsys`, `Mem Used` / `Mem Pressure` / `Mem Free%` read `N/A`. Without `membw`, `Mem BW` reads `N/A GB/s`. `membw` and powermetrics need `sudo`.
+If a helper is missing, only its fields read `N/A` — everything else still works:
+
+| Missing helper | Fields that read `N/A` |
+|---|---|
+| `memfoot` | `Mem`, `Mem Peak` |
+| `memsys` | `Mem Used`, `Mem Pressure`, `Mem Free%` |
+| `membw` | `Mem BW` |
+
+`powermetrics` always needs `sudo` (CPU/GPU power). `membw` needs `sudo` on M1/M4 (AMC Stats); on M4 Pro / M4 Max it uses PMP histograms and does **not**.
 
 ## Usage
 ```
@@ -70,7 +78,7 @@ Each line looks like:
   - `CPU Power`: Package CPU power draw (powermetrics).
   - `GPU Power`: GPU power draw (powermetrics).
   - `GPU%`: GPU HW active residency (powermetrics).
-  - `Mem BW`: DRAM read+write bandwidth in GB/s, measured over a 1s interval (`membw` helper — see "Memory Bandwidth" below).
+  - `Mem BW`: DRAM read+write bandwidth in GB/s, measured over `MEMPLUS_BW_INTERVAL` seconds (default **0.2**; see "Memory Bandwidth" below).
   - `Mem BW Max`: Decaying high-water mark for `Mem BW` — the highest value seen, but it *forgets* a peak that hasn't been matched or beaten for `MEMPLUS_BW_WINDOW_SEC` seconds (default 900). Persisted in `/tmp/mem-plus-membw-max`; delete that file to reset it. See "Mem BW Max — the Decaying Peak" below.
   - `Mem Used`: System-wide RAM used — Activity Monitor's "Memory Used" (`App + Wired + Compressed`; cached files excluded).
   - `Mem Pressure`: `Normal`, `Warn`, or `Critical` — derived from `memorystatus_get_level()` free % (Activity Monitor's pressure graph).
@@ -147,17 +155,25 @@ clang -O2 -o memsys memsys.c
 No `sudo` required. If the binary is missing, those three fields read `N/A`.
 
 ## Memory Bandwidth (the `membw` helper)
-powermetrics on Apple Silicon exposes **no** memory-bandwidth sampler (its samplers are only tasks, battery, network, disk, interrupts, cpu_power, thermal, sfi, gpu_power, ane_power). DRAM bandwidth lives only in the private **IOReport** framework — the same source asitop/macmon/mactop read.
+powermetrics on Apple Silicon has **no** memory-bandwidth sampler (its samplers are tasks, battery, network, disk, interrupts, cpu_power, thermal, sfi, gpu_power, ane_power). Live DRAM GB/s lives only in the private **IOReport** framework.
 
-So mem-plus ships a tiny companion, **`membw.c`**, that you compile once:
+Compile the helper once:
 ```bash
 clang -O2 -framework CoreFoundation -o membw membw.c
 ```
-It `dlopen`s `libIOReport.dylib` and reads **only** the aggregate AMC `DCS RD` / `DCS WR` byte counters over a 1-second interval, prints combined read+write GB/s, and exits. mem-plus calls it (via `sudo`) once per invocation to fill `Mem BW`; `Mem BW Max` is then a time-decaying peak derived from it (see "Mem BW Max — the Decaying Peak" below).
 
-Why a bespoke helper instead of shelling out to mactop: a full mactop sample also opens the NVMe/disk IOKit user client, which holds it exclusively and **locks out `smartctl`** for the duration of the sample. `membw` touches *only* the memory-controller counters and never opens a disk user client, so it does not interfere with `smartctl` (verified: smartctl reads all disks fine while `membw` runs in a tight loop).
+`membw` `dlopen`s `libIOReport.dylib`, samples for `MEMPLUS_BW_INTERVAL` seconds (default **0.2**), and prints combined read+write GB/s. Two sources, tried in order:
 
-Accuracy tracks mactop's `dram_bw_combined_gbs` within a few percent under load (no scale factor applied; small gaps are just non-overlapping sample windows).
+| Chip | IOReport source | sudo |
+|------|-----------------|------|
+| M1, M4 | AMC Stats byte counters `DCS RD` / `DCS WR` | yes |
+| **M4 Pro, M4 Max** | PMP `DCS BW` / `AMCC RD+WR` rate histograms | **no** |
+
+On M4 Pro the AMC Stats group will not subscribe (`IOReportCreateSubscription` returns NULL — ~190 channels including `DCS F1`–`F6` bins; the names `DCS RD`/`DCS WR` exist in the catalog but never appear in a sample delta). That is why `Mem BW` used to read `N/A`. PMP subscribes without root. Its AMCC histograms are 32 residency buckets labeled `16GB/s`…`256GB/s`; membw reports the residency-weighted average over the window.
+
+mem-plus runs `membw` without sudo first, then `sudo membw` if that printed nothing, so M1/M4 still work. `Mem BW Max` is a time-decaying peak of those samples (see below).
+
+Why not shell out to mactop: a full mactop sample also opens the NVMe/disk IOKit user client and **locks out `smartctl`** for the duration. `membw` never opens a disk user client (verified: smartctl reads all disks while `membw` runs in a tight loop). On M1/M4, AMC byte counts track mactop's `dram_bw_combined_gbs` within a few percent (non-overlapping windows). On M4 Pro, mactop has the same AMC gap; the PMP histogram is the working path.
 
 If the `membw` binary isn't built/present, `Mem BW` reads `N/A GB/s` and everything else still works.
 
@@ -194,5 +210,5 @@ Running it on a short interval like this is also what makes `Mem BW Max` behave 
 - powermetrics needs sudo; it is called once per invocation. You may be prompted for your password (or configure passwordless sudo for it).
 - `Mem` / `Mem Peak` require the bundled `memfoot` helper (`clang -O2 -o memfoot memfoot.c`). It reads `phys_footprint` via `proc_pid_rusage` and does not walk VM regions like `vmmap`, so it won't hitch live apps.
 - `Mem Used` / `Mem Pressure` / `Mem Free%` require `memsys` (`clang -O2 -o memsys memsys.c`).
-- The `Mem BW` fields require the bundled `membw` helper, compiled once with `clang -O2 -framework CoreFoundation -o membw membw.c`. It also needs sudo (IOReport access). The compiled binaries are gitignored — only the `.c` sources are tracked. If missing, those fields read `N/A`.
+- The `Mem BW` fields require the bundled `membw` helper (`clang -O2 -framework CoreFoundation -o membw membw.c`). M4 Pro / M4 Max: no sudo (PMP histograms). M1/M4: falls back to sudo for AMC Stats. Compiled binaries are gitignored — only the `.c` sources are tracked. If missing, those fields read `N/A`.
 - jq is only needed if you want pretty output; the tool itself emits valid JSON without it.
