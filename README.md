@@ -169,7 +169,7 @@ clang -O2 -framework CoreFoundation -o membw membw.c
 | M1, M4 | AMC Stats byte counters `DCS RD` / `DCS WR` | yes |
 | **M4 Pro, M4 Max** | PMP `DCS BW` / `AMCC RD+WR` rate histograms | **no** |
 
-On M4 Pro the AMC Stats group will not subscribe (`IOReportCreateSubscription` returns NULL — ~190 channels including `DCS F1`–`F6` bins; the names `DCS RD`/`DCS WR` exist in the catalog but never appear in a sample delta). That is why `Mem BW` used to read `N/A`. PMP subscribes without root. Its AMCC histograms are 32 residency buckets labeled `16GB/s`…`256GB/s`; membw reports the residency-weighted average over the window.
+On M4 Pro the AMC Stats group will not subscribe (`IOReportCreateSubscription` returns NULL — ~190 channels including `DCS F1`–`F6` bins; the names `DCS RD`/`DCS WR` exist in the catalog but never appear in a sample delta). That is why `Mem BW` used to read `N/A`. PMP subscribes without root. Its AMCC histograms are 32 residency buckets labeled `16GB/s`…`512GB/s`. The first bucket is an underflow bin (everything below 16 GB/s, including true idle ~0.1 GB/s on an M4-base AMC reading); membw counts that bucket as 0 and takes a residency-weighted average of the rest, otherwise idle would be a phantom 16 GB/s. Traffic that stays entirely under 16 GB/s is therefore indistinguishable from idle.
 
 mem-plus runs `membw` without sudo first, then `sudo membw` if that printed nothing, so M1/M4 still work. `Mem BW Max` is a time-decaying peak of those samples (see below).
 
