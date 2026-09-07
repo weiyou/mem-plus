@@ -15,9 +15,11 @@
 //
 //   2. PMP "DCS BW" / "AMCC RD|WR|RD+WR" rate histograms (M4 Pro / M4 Max,
 //      and any chip where AMC Stats will not subscribe). These are 32-bucket
-//      residencies labeled "16GB/s".."256GB/s" (or "1GB/s"..). The
-//      residency-weighted average of the bucket labels is the GB/s over the
-//      sample window. PMP subscribes without root on M4 Pro.
+//      residencies labeled "16GB/s".."512GB/s". The first bucket is an
+//      underflow bin (everything below 16 GB/s, including true idle ~0.1);
+//      treating its label as 16 made idle look like a phantom 16 GB/s.
+//      Bucket 0 is counted as 0; higher buckets keep their labels. PMP
+//      subscribes without root on M4 Pro.
 //
 // Why M4 Pro cannot use (1) the way M4/M1 can: the M4 Pro AMC Stats group
 // has ~190 channels including DCS F1–F6 bins, and IOReportCreateSubscription
@@ -218,6 +220,12 @@ static double gbs_from_amc(CFDictionaryRef delta, double dt) {
 
 // Residency-weighted average of a "16GB/s" / "1GB/s" histogram. Returns -1
 // if this channel is not a usable histogram.
+//
+// The first bucket is an underflow/floor bin: on M4 Pro the labels start at
+// 16 GB/s with no 0 bucket, so idle residency sits entirely in "16GB/s"
+// even when true DRAM traffic is ~0.1 GB/s (the M4-base AMC idle reading).
+// Count bucket 0 as 0 GB/s ("below the first label"). Higher buckets keep
+// their labels; under load bucket 0 is empty so the reading is unchanged.
 static double hist_avg_gbs(CFDictionaryRef ch) {
     if (!IOReportStateGetCount || !IOReportStateGetNameForIndex ||
         !IOReportStateGetResidency)
@@ -234,8 +242,8 @@ static double hist_avg_gbs(CFDictionaryRef ch) {
         char sn[64] = {0};
         cf_to_buf(IOReportStateGetNameForIndex(ch, s), sn, sizeof(sn));
         // atof skips leading spaces: "  16GB/s" -> 16.0
-        double gbps = atof(sn);
-        if (gbps <= 0.0)
+        double gbps = (s == 0) ? 0.0 : atof(sn);
+        if (s != 0 && gbps <= 0.0)
             continue;
         weighted += gbps * (double)r;
         tot += r;
