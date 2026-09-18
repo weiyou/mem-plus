@@ -169,7 +169,22 @@
 # -----------------------------------------------------------------------------
 # A plain zsh loop re-runs it on an interval. Ctrl-C to stop:
 #
-#     while :; do mem-plus "llama-server|python" | jq .; sleep 10; done
+#     while :; do date "+%Y%m%d-%H%M%S"; mem-plus "llama-server|python" | jq .; sleep 10; done
+#
+# sleep 10 is the recommended default (human-facing snapshot, not a profiler).
+# Each invocation already takes ~1.5–2 s (powermetrics 300 ms, membw 200 ms,
+# top -l 2 -s 1 a full second), so the real period is ~12 s — well above XNU's
+# 1 s host_statistics64 cache window. 2–3 s only if you are watching a live
+# generation (GPU%/BW); 30–60 s for a babysitter; do not go under ~2 s unless
+# you drop top/powermetrics.
+#
+# The loop does NOT cache Mem Used (fresh memsys each iteration). If that
+# field looks glued across 10 s ticks, it is almost never loop state: either
+# %.2f GB really did not move (~11 MB/step), pgrep -f matched the watcher
+# itself and you are staring at a wall of identical Total blocks, or the
+# current sudo/powermetrics/top call hung (date printed, previous jq still
+# on screen). See README "Watching / Repeating" and "Why Mem Used can look
+# frozen in a watch loop".
 #
 # -----------------------------------------------------------------------------
 # REQUIREMENTS / NOTES

@@ -154,6 +154,8 @@ clang -O2 -o memsys memsys.c
 
 No `sudo` required. If the binary is missing, those three fields read `N/A`.
 
+`Mem Used` is `%.2f GB` (one step is ~11 MB on a 16 KB page machine). It is **not** cached by the watch loop — each `mem-plus` spawns a fresh `memsys`. What *can* freeze it is XNU: `host_statistics64` is rate-limited for non-platform (adhoc-signed) binaries like `memsys`, and serves a **global 1-second snapshot** after a random 2–10 live queries in that window. `/usr/bin/vm_stat` is a platform binary and is not throttled. `Mem Pressure` / `Mem Free%` use `memorystatus_get_level()`, a different path, so they can still move while `Mem Used` is glued. See "Why Mem Used can look frozen" below.
+
 ## Memory Bandwidth (the `membw` helper)
 powermetrics on Apple Silicon has **no** memory-bandwidth sampler (its samplers are tasks, battery, network, disk, interrupts, cpu_power, thermal, sfi, gpu_power, ane_power). Live DRAM GB/s lives only in the private **IOReport** framework.
 
@@ -201,9 +203,40 @@ mem-plus llama-server | jq .
 ## Watching / Repeating (no `watch` Needed)
 A plain zsh loop re-runs it on an interval. Ctrl-C to stop:
 ```bash
-while :; do mem-plus "llama-server|python" | jq .; sleep 10; done
+while :; do date "+%Y%m%d-%H%M%S"; mem-plus "llama-server|python" | jq .; sleep 10; done
 ```
-Running it on a short interval like this is also what makes `Mem BW Max` behave as a rolling peak — keep the loop interval well under `MEMPLUS_BW_WINDOW_SEC` so a busy workload keeps refreshing the mark before it decays.
+
+`sleep 10` is the recommended default for a **human-facing snapshot**, not a high-resolution profiler.
+
+Each `mem-plus` already burns about **1.5–2 s** of wall time before the sleep (`powermetrics` 300 ms, `membw` 200 ms, `top -l 2 -s 1` a full second). So a `sleep 10` loop is really sampling about every **12 s**. That is well above XNU's **1 s** `host_statistics64` cache window, so `Mem Used` will not freeze because of that cache.
+
+**10 s is a good fit for:**
+
+- `Mem Used` / pressure / free % — system RAM moves slowly except at model load/unload. At `%.2f GB` you only see ~11 MB steps.
+- Per-process `Mem` / RSS once models are resident.
+- A terminal you glance at — faster just fills the screen with another wall of `jq`.
+
+**10 s is a poor fit for:**
+
+- `Mem BW` — each sample is only a **0.2 s** window, then you wait 10 s. Prefill spikes are easy to miss. `Mem BW Max` exists for that, but with this duty cycle it is a lottery, not a peak meter. Keep the loop interval well under `MEMPLUS_BW_WINDOW_SEC` (default 900) so a *busy* workload still has a chance to refresh the mark before it decays.
+- `CPU%` / `GPU%` / power — one short snapshot per cycle. A decode that lasts a few seconds can land entirely between samples.
+
+**Other intervals:** drop to **2–3 s** only if you are watching a live generation and care about GPU%/BW. Go to **30–60 s** if it is just a babysitter. Do not go under ~2 s unless you drop `top`/`powermetrics`; you would spend more time sampling than watching, and you would start colliding with the 1 s kernel cache.
+
+### Why `Mem Used` can look frozen in a watch loop
+A `while` loop does **not** hold `Mem Used`. Each iteration is a new `mem-plus` → new `memsys` process. There is no loop-local cache for that field (the only `/tmp` state is `Mem BW Max`). Killing the loop and starting another one does not flush a bash cache; it just takes a new kernel sample after a pause.
+
+`Mem Used` comes from `memsys` via `host_statistics64(HOST_VM_INFO64)` (App + Wired + Compressed). XNU rate-limits that call for **non-platform** binaries and serves a **global** snapshot: 1-second window, a random 2–10 live replies, then cached copies for the rest of the window. `memsys` is adhoc linker-signed, so it is in that bucket. `/usr/bin/vm_stat` is a platform binary and is not.
+
+Measured on macOS 27 (xnu-13432): a tight burst of 40 `host_statistics64` calls (or 25 new `memsys` processes) all printed the same `used_pages`; spacing of 1–2 s tracked an 800 MB allocation (`33.13 → 33.52 → 33.81` GB). A `sleep 10` loop should therefore get a **live** sample every time. The cache can make `Mem Used` look glued only if something calls `host_statistics64` more than a few times **within the same second** (a tight loop, two overlapping `mem-plus`es, a Python `psutil` poller). It cannot hold one value across many 10-second iterations.
+
+If a 10 s loop *looks* stuck, it is almost always one of these:
+
+1. **The rounded number really did not move.** Dual-serve idle can sit on the same hundredths digit for a long time. Per-process `Mem` (Metal / `phys_footprint` via `memfoot`) can still change. `Mem Used` will not, until `wire+internal+compressor` moves by ~11 MB.
+2. **A wall of identical `Total` blocks.** `pgrep -f` is a regex on the full command line. A pattern like `llama-server|python` matches the servers, **and** `mem-plus` itself (the pattern is on its argv), `sudo mem-plus …`, and a parent shell whose command line contains that string. Every JSON line repeats the same `Total.Mem Used`. Easy to eye-lock on an old block; a new loop puts a fresh block at the cursor.
+3. **A hung iteration, not a stale sampler.** If you print `date` *before* `mem-plus` and that `sudo mem-plus` blocks (sudo password after the 5-minute timestamp, `powermetrics`, or `top -l 2 -s 1`), you get a new timestamp and the previous jq blob still on screen. Ctrl-C kills the stuck child; the next run completes and looks like a refresh. Check stderr: you should see `Sampling power metrics...` finish with `Done` each cycle.
+
+**Diagnostic:** `Mem Free%` / `Mem Pressure` come from `memorystatus_get_level()`, which is **not** the `host_statistics64` cache. If those two were moving while `Mem Used` was glued, that is the 1 s kernel cache. If the date froze too, `mem-plus` never finished. Compare `memsys` to `vm_stat` (wired + anonymous + compressor) on the same tick: if `vm_stat` moved and `memsys` did not, it is the rate-limit cache.
 
 ## Requirements / Notes
 - macOS on Apple Silicon (uses `memfoot`, `memsys`, powermetrics, ps -o comm/rss, and IOReport for bandwidth).
