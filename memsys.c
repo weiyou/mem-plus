@@ -19,6 +19,14 @@
 //     >= 60% free -> Normal, >= 30% -> Warn, else Critical.
 // Do NOT use kern.memorystatus_vm_pressure_level — it lags behind the graph.
 //
+// host_statistics64 is rate-limited for non-platform (adhoc-signed) binaries:
+// XNU serves a global 1 s snapshot after a random 2–10 live queries in that
+// window. memsys is a new process each call, so a watch loop with sleep >= 2 s
+// gets live data. A tight burst of memsys processes will all print the same
+// Mem Used. /usr/bin/vm_stat is a platform binary and is not rate-limited.
+// memorystatus_get_level() (Free% / Pressure) is a different path and is not
+// covered by that cache.
+//
 // Build:
 //     clang -O2 -o memsys memsys.c
 //
