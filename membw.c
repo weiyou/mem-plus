@@ -5,27 +5,29 @@
 // Apple Silicon exposes no memory-bandwidth sampler via powermetrics. The only
 // source is the private IOReport framework.
 //
-// Two chip-dependent sources, tried in order:
+// Two chip-dependent sources, tried in order. Neither path calls sudo.
 //
-//   1. AMC Stats byte counters (M1–M4 base; needs a successful AMC
-//      subscription, which is typically root):
+//   1. AMC Stats byte counters (base M4, and any chip where the group
+//      subscribes and the delta contains DCS byte channels):
 //         "DCS RD" / "DCS WR"            aggregate DRAM bytes
-//         "DCS F<n> RD" / "DCS F<n> WR"  per-frequency-bin bytes (M4 Pro)
+//         "DCS F<n> RD" / "DCS F<n> WR"  per-frequency-bin bytes
 //         "DCS"                          combined RD+WR bytes
+//      On a base M4 Mac mini (Mac16,10, macOS 27) this subscribes as a
+//      normal user. Idle is a few GB/s; an all-core copy reads ~106 GB/s,
+//      matching DCS RD+WR.
 //
 //   2. PMP "DCS BW" / "AMCC RD|WR|RD+WR" rate histograms (M4 Pro / M4 Max,
 //      and any chip where AMC Stats will not subscribe). These are 32-bucket
-//      residencies labeled "16GB/s".."512GB/s". The first bucket is an
-//      underflow bin (everything below 16 GB/s, including true idle ~0.1);
-//      treating its label as 16 made idle look like a phantom 16 GB/s.
-//      Bucket 0 is counted as 0; higher buckets keep their labels. PMP
-//      subscribes without root on M4 Pro.
+//      residencies labeled "16GB/s".."512GB/s" on M4 Pro. The first bucket is
+//      an underflow bin (everything below the first label, including true
+//      idle ~0.1 GB/s); treating its label as 16 made idle look like a
+//      phantom 16 GB/s. Bucket 0 is counted as 0; higher buckets keep their
+//      labels. PMP subscribes without root.
 //
-// Why M4 Pro cannot use (1) the way M4/M1 can: the M4 Pro AMC Stats group
-// has ~190 channels including DCS F1–F6 bins, and IOReportCreateSubscription
-// on that group alone returns NULL. The aggregate names "DCS RD"/"DCS WR"
-// exist in the channel catalog but never appear in a sample delta. PMP is
-// the working path.
+// Why M4 Pro cannot use (1): the M4 Pro AMC Stats group has ~190 channels
+// including DCS F1–F6 bins, and IOReportCreateSubscription on that group
+// alone returns NULL. The aggregate names "DCS RD"/"DCS WR" exist in the
+// channel catalog but never appear in a sample delta. PMP is the working path.
 //
 // This helper never opens an NVMe/disk IOKit user client, so it cannot lock
 // out smartctl the way a full mactop sample can.
@@ -38,8 +40,7 @@
 //     clang -O2 -Wall -framework CoreFoundation -o membw membw.c
 //
 // Usage:
-//     ./membw [interval_seconds]      # default interval 1.0; no sudo on M4 Pro
-//     sudo ./membw [interval_seconds] # needed for AMC Stats on M1/M4
+//     ./membw [interval_seconds]      # default interval 1.0; no sudo
 // =============================================================================
 
 #include <CoreFoundation/CoreFoundation.h>
@@ -372,7 +373,7 @@ int main(int argc, char **argv) {
     IOReportSubscriptionRef sub =
         IOReportCreateSubscription(NULL, pmp_chans, &subbed, 0, NULL);
     if (!sub) {
-        fprintf(stderr, "membw: IOReportCreateSubscription failed (need sudo?)\n");
+        fprintf(stderr, "membw: IOReportCreateSubscription failed\n");
         return 1;
     }
     CFMutableDictionaryRef sample_chans = subbed ? subbed : pmp_chans;

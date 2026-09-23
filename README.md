@@ -19,7 +19,7 @@ If a helper is missing, only its fields read `N/A` — everything else still wor
 | `memsys` | `Mem Used`, `Mem Pressure`, `Mem Free%` |
 | `membw` | `Mem BW` |
 
-`powermetrics` always needs `sudo` (CPU/GPU power). `membw` needs `sudo` on M1/M4 (AMC Stats); on M4 Pro / M4 Max it uses PMP histograms and does **not**.
+`powermetrics` always needs `sudo` (CPU power). `membw` does not: base M4 reads AMC Stats byte counters as a normal user, and M4 Pro / M4 Max use PMP histograms.
 
 ## Usage
 ```
@@ -166,16 +166,18 @@ Compile the helper once:
 clang -O2 -framework CoreFoundation -o membw membw.c
 ```
 
-`membw` `dlopen`s `libIOReport.dylib`, samples for `MEMPLUS_BW_INTERVAL` seconds (default **0.2**), and prints combined read+write GB/s. Two sources, tried in order:
+`membw` `dlopen`s `libIOReport.dylib`, samples for `MEMPLUS_BW_INTERVAL` seconds (default **0.2**), and prints combined read+write GB/s. It does not call sudo. Two sources, tried in order:
 
 | Chip | IOReport source | sudo |
 |------|-----------------|------|
-| M1, M4 | AMC Stats byte counters `DCS RD` / `DCS WR` | yes |
+| **M4** | AMC Stats byte counters `DCS RD` / `DCS WR` | **no** |
 | **M4 Pro, M4 Max** | PMP `DCS BW` / `AMCC RD+WR` rate histograms | **no** |
+
+On a base M4 the AMC Stats group subscribes as a normal user, and `DCS RD` + `DCS WR` are live byte counters. Checked on a Mac mini (Mac16,10, macOS 27): desktop idle was a few GB/s, and an 8-thread copy held 105.8 GB/s, matching the `DCS` aggregate for the same window.
 
 On M4 Pro the AMC Stats group will not subscribe (`IOReportCreateSubscription` returns NULL — ~190 channels including `DCS F1`–`F6` bins; the names `DCS RD`/`DCS WR` exist in the catalog but never appear in a sample delta). That is why `Mem BW` used to read `N/A`. PMP subscribes without root. Its AMCC histograms are 32 residency buckets labeled `16GB/s`…`512GB/s`. The first bucket is an underflow bin (everything below 16 GB/s, including true idle ~0.1 GB/s on an M4-base AMC reading); membw counts that bucket as 0 and takes a residency-weighted average of the rest, otherwise idle would be a phantom 16 GB/s. Traffic that stays entirely under 16 GB/s is therefore indistinguishable from idle.
 
-mem-plus runs `membw` without sudo first, then `sudo membw` if that printed nothing, so M1/M4 still work. `Mem BW Max` is a time-decaying peak of those samples (see below).
+`Mem BW Max` is a time-decaying peak of those samples (see below).
 
 Why not shell out to mactop: a full mactop sample also opens the NVMe/disk IOKit user client and **locks out `smartctl`** for the duration. `membw` never opens a disk user client (verified: smartctl reads all disks while `membw` runs in a tight loop). On M1/M4, AMC byte counts track mactop's `dram_bw_combined_gbs` within a few percent (non-overlapping windows). On M4 Pro, mactop has the same AMC gap; the PMP histogram is the working path.
 
@@ -187,7 +189,7 @@ If the `membw` binary isn't built/present, `Mem BW` reads `N/A GB/s` and everyth
 MEMPLUS_BW_WINDOW_SEC=300 mem-plus llama-server   # 5-minute decay window
 ```
 
-How it works — the state is a single number in `/tmp/mem-plus-membw-max`, and the file's **mtime marks when that peak was last set**. Each run:
+How it works — the state is a single number in `/tmp/mem-plus-membw-max`, and the file's **mtime marks when that peak was last set**. If that file exists but is not writable (a previous `sudo mem-plus` leaves it owned by root), the mark is kept in `/tmp/mem-plus-membw-max.<uid>` instead. Each run:
 - file missing or older than the window → **reseed** the max to the current sample;
 - current `Mem BW` > stored max → **new high**, rewrite (restarting the decay clock);
 - otherwise → leave the file (and its mtime) **untouched**, so the decay clock keeps counting from the last peak.
@@ -245,5 +247,5 @@ If a 10 s loop *looks* stuck, it is almost always one of these:
 - powermetrics needs sudo; it is called once per invocation. You may be prompted for your password (or configure passwordless sudo for it).
 - `Mem` / `Mem Peak` require the bundled `memfoot` helper (`clang -O2 -o memfoot memfoot.c`). It reads `phys_footprint` via `proc_pid_rusage` and does not walk VM regions like `vmmap`, so it won't hitch live apps.
 - `Mem Used` / `Mem Pressure` / `Mem Free%` require `memsys` (`clang -O2 -o memsys memsys.c`).
-- The `Mem BW` fields require the bundled `membw` helper (`clang -O2 -framework CoreFoundation -o membw membw.c`). M4 Pro / M4 Max: no sudo (PMP histograms). M1/M4: falls back to sudo for AMC Stats. Compiled binaries are gitignored — only the `.c` sources are tracked. If missing, those fields read `N/A`.
+- The `Mem BW` fields require the bundled `membw` helper (`clang -O2 -framework CoreFoundation -o membw membw.c`). No sudo: base M4 uses AMC Stats byte counters, M4 Pro / M4 Max use PMP histograms. Compiled binaries are gitignored — only the `.c` sources are tracked. If missing, those fields read `N/A`.
 - jq is only needed if you want pretty output; the tool itself emits valid JSON without it.
