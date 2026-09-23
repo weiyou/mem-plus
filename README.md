@@ -80,7 +80,7 @@ Each line looks like:
   - `GPU%`: GPU HW active residency (powermetrics).
   - `Mem BW`: DRAM read+write bandwidth in GB/s, measured over `MEMPLUS_BW_INTERVAL` seconds (default **0.2**; see "Memory Bandwidth" below).
   - `Mem BW Max`: Decaying high-water mark for `Mem BW` — the highest value seen, but it *forgets* a peak that hasn't been matched or beaten for `MEMPLUS_BW_WINDOW_SEC` seconds (default 900). Persisted in `/tmp/mem-plus-membw-max`; delete that file to reset it. See "Mem BW Max — the Decaying Peak" below.
-  - `Mem Used`: System-wide RAM used — Activity Monitor's "Memory Used" (`App + Wired + Compressed`). App Memory is anonymous pages minus volatile purgeable pages; purgeable and file-backed pages are Cached Files and are excluded.
+  - `Mem Used`: System-wide RAM used — the "Memory Used" label in Activity Monitor. That label is physical RAM minus file-backed pages minus empty free pages. It is larger than App + Wired + Compressed: volatile purgeable pages stay in the label, and so does RAM `vm_stat` never assigns to a bucket. Cached Files is file-backed plus purgeable, so it is not the term subtracted here.
   - `Mem Pressure`: `Normal`, `Warn`, or `Critical` — derived from `memorystatus_get_level()` free % (Activity Monitor's pressure graph).
   - `Mem Free%`: Percent of RAM available (same API as `memory_pressure(1)`'s "System-wide memory free percentage").
 
@@ -144,8 +144,10 @@ If the `memfoot` binary isn't built/present, `Mem` / `Mem Peak` read `N/A` and e
 ## System Memory (the `memsys` helper)
 Activity Monitor's Memory tab shows two headline figures mem-plus now mirrors in `Total`:
 
-- **Memory Used** → `Mem Used` — `(wire_count + (internal_page_count - purgeable_count) + compressor_page_count) × page_size`, matching App + Wired + Compressed. App Memory is anonymous pages minus volatile purgeable pages; Activity Monitor counts those purgeable pages with Cached Files. File-backed pages (`external_page_count`) are also excluded.
+- **Memory Used** → `Mem Used` — `hw.memsize − external_page_count × page_size − (free_count − speculative_count) × page_size`.
 - **Memory Pressure** → `Mem Pressure` + `Mem Free%` — from `memorystatus_get_level()` (the same call `memory_pressure(1)` uses). Pressure labels use Apple's documented thresholds: ≥ 60% free = Normal, ≥ 30% = Warn, else Critical. The `kern.memorystatus_vm_pressure_level` sysctl lags and is not used.
+
+The bullet beside "Memory Used" looks like a sum of App Memory, Wired Memory, and Compressed. The label is a different total: physical RAM that is neither file-backed nor empty. `free_count` already includes speculative pages, so the empty term is `free_count − speculative_count`, the same quantity `vm_stat` prints as "Pages free". Cached Files is file-backed pages plus volatile purgeable pages, so those purgeable pages stay in the label. So does the part of `hw.memsize` that `vm_stat` never assigns to a bucket — about 0.5 GB on the 24 GB machine this was checked against. There the three lines added up to about 0.7 GB under the label (the purgeable slice, plus that unclassified 0.5 GB). `memsys` follows the label. Summing the three lines reports committed VM pages and leaves both of those out.
 
 Build once:
 ```bash
@@ -226,17 +228,17 @@ Each `mem-plus` already burns about **1.5–2 s** of wall time before the sleep 
 ### Why `Mem Used` can look frozen in a watch loop
 A `while` loop does **not** hold `Mem Used`. Each iteration is a new `mem-plus` → new `memsys` process. There is no loop-local cache for that field (the only `/tmp` state is `Mem BW Max`). Killing the loop and starting another one does not flush a bash cache; it just takes a new kernel sample after a pause.
 
-`Mem Used` comes from `memsys` via `host_statistics64(HOST_VM_INFO64)` (App + Wired + Compressed). XNU rate-limits that call for **non-platform** binaries and serves a **global** snapshot: 1-second window, a random 2–10 live replies, then cached copies for the rest of the window. `memsys` is adhoc linker-signed, so it is in that bucket. `/usr/bin/vm_stat` is a platform binary and is not.
+`Mem Used` comes from `memsys` via `hw.memsize` and `host_statistics64(HOST_VM_INFO64)` (physical − file-backed − empty free). XNU rate-limits that statistics call for **non-platform** binaries and serves a **global** snapshot: 1-second window, a random 2–10 live replies, then cached copies for the rest of the window. `memsys` is adhoc linker-signed, so it is in that bucket. `/usr/bin/vm_stat` is a platform binary and is not.
 
 Measured on macOS 27 (xnu-13432): a tight burst of 40 `host_statistics64` calls (or 25 new `memsys` processes) all printed the same `used_pages`; spacing of 1–2 s tracked an 800 MB allocation (`33.13 → 33.52 → 33.81` GB). A `sleep 10` loop should therefore get a **live** sample every time. The cache can make `Mem Used` look glued only if something calls `host_statistics64` more than a few times **within the same second** (a tight loop, two overlapping `mem-plus`es, a Python `psutil` poller). It cannot hold one value across many 10-second iterations.
 
 If a 10 s loop *looks* stuck, it is almost always one of these:
 
-1. **The rounded number really did not move.** Dual-serve idle can sit on the same hundredths digit for a long time. Per-process `Mem` (Metal / `phys_footprint` via `memfoot`) can still change. `Mem Used` will not, until `wire+internal+compressor` moves by ~11 MB.
+1. **The rounded number really did not move.** Dual-serve idle can sit on the same hundredths digit for a long time. Per-process `Mem` (Metal / `phys_footprint` via `memfoot`) can still change. `Mem Used` will not, until file-backed or empty-free pages move by ~11 MB.
 2. **A wall of identical `Total` blocks.** `pgrep -f` is a regex on the full command line. A pattern like `llama-server|python` matches the servers, **and** `mem-plus` itself (the pattern is on its argv), `sudo mem-plus …`, and a parent shell whose command line contains that string. Every JSON line repeats the same `Total.Mem Used`. Easy to eye-lock on an old block; a new loop puts a fresh block at the cursor.
 3. **A hung iteration, not a stale sampler.** If you print `date` *before* `mem-plus` and that `sudo mem-plus` blocks (sudo password after the 5-minute timestamp, `powermetrics`, or `top -l 2 -s 1`), you get a new timestamp and the previous jq blob still on screen. Ctrl-C kills the stuck child; the next run completes and looks like a refresh. Check stderr: you should see `Sampling power metrics...` finish with `Done` each cycle.
 
-**Diagnostic:** `Mem Free%` / `Mem Pressure` come from `memorystatus_get_level()`, which is **not** the `host_statistics64` cache. If those two were moving while `Mem Used` was glued, that is the 1 s kernel cache. If the date froze too, `mem-plus` never finished. Compare `memsys` to `vm_stat` (wired + anonymous + compressor) on the same tick: if `vm_stat` moved and `memsys` did not, it is the rate-limit cache.
+**Diagnostic:** `Mem Free%` / `Mem Pressure` come from `memorystatus_get_level()`, which is **not** the `host_statistics64` cache. If those two were moving while `Mem Used` was glued, that is the 1 s kernel cache. If the date froze too, `mem-plus` never finished. Compare `memsys` to `vm_stat` on the same tick (`hw.memsize` minus file-backed pages minus "Pages free"): if `vm_stat` moved and `memsys` did not, it is the rate-limit cache.
 
 ## Requirements / Notes
 - macOS on Apple Silicon (uses `memfoot`, `memsys`, powermetrics, ps -o comm/rss, and IOReport for bandwidth).
