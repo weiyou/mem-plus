@@ -41,9 +41,11 @@
 #   NCPU%       CPU% normalized by logical core count (hw.ncpu): CPU% / ncpu.
 #               Caps at ~100% = the process is using the entire machine.
 #   Total       System-wide metrics, sampled ONCE per invocation:
-#     CPU Power   Package CPU power draw (powermetrics).
-#     GPU Power   GPU power draw (powermetrics).
-#     GPU%        GPU HW active residency (powermetrics).
+#     CPU Power   Package CPU power draw (powermetrics). N/A when
+#                 MEMPLUS_POWER=0, which skips the sudo sample.
+#     GPU Power   GPU power draw (powermetrics). N/A when MEMPLUS_POWER=0.
+#     GPU%        GPU HW active residency (powermetrics). N/A when
+#                 MEMPLUS_POWER=0.
 #     Mem BW      DRAM read+write bandwidth in GB/s (membw helper, see below).
 #     Mem BW Max  Session high-water mark for Mem BW: the highest value seen
 #                 across repeated mem-plus runs. Persisted in
@@ -196,6 +198,8 @@
 #   * macOS (uses memfoot, powermetrics, ps -o comm/rss).
 #   * powermetrics needs sudo; it is called once per invocation. You may be
 #     prompted for your password (or configure passwordless sudo for it).
+#     MEMPLUS_POWER=0 skips that call. CPU Power, GPU Power, and GPU% then
+#     read N/A, and mem-plus does not ask for a password.
 #   * Mem / Mem Peak come from the bundled `memfoot` helper (memfoot.c), which
 #     must be compiled once: clang -O2 -o memfoot memfoot.c
 #     It reads phys_footprint via proc_pid_rusage (same source as Activity
@@ -245,17 +249,22 @@ fi
 printf " Done\n" >&2
 
 # === Get system-wide power metrics ONCE ===
-# CPU package power still comes from powermetrics and needs sudo.
+# CPU package power comes from powermetrics and needs sudo.
+# MEMPLUS_POWER=0 skips that call; CPU Power, GPU Power, and GPU% read N/A.
 # Mem BW was sampled above, so this prompt does not gate it.
-printf "Sampling power metrics..." >&2
-power_data=$(sudo powermetrics --samplers cpu_power,gpu_power -i 300 -n 1 2>/dev/null)
+cpu_power=""; gpu_power=""; gpu_pct=""
+if [[ ${MEMPLUS_POWER:-1} != 0 ]]; then
+    printf "Sampling power metrics..." >&2
+    power_data=$(sudo powermetrics --samplers cpu_power,gpu_power -i 300 -n 1 2>/dev/null)
 
-# Robust parsing
-cpu_power=$(echo "$power_data" | grep -E "CPU Power:" | head -1 | awk '{print $3 $4}')
-gpu_pct=$(echo "$power_data" | grep -E "GPU HW active residency" | awk '{print $5}' | tr -d '%')
-gpu_power=$(echo "$power_data" | grep -E "GPU Power:" | head -1 | awk '{print $3 $4}')
+    # Robust parsing
+    cpu_power=$(echo "$power_data" | grep -E "CPU Power:" | head -1 | awk '{print $3 $4}')
+    gpu_pct=$(echo "$power_data" | grep -E "GPU HW active residency" | awk '{print $5}' | tr -d '%')
+    gpu_power=$(echo "$power_data" | grep -E "GPU Power:" | head -1 | awk '{print $3 $4}')
+    [[ -n "$gpu_pct" ]] && gpu_pct="${gpu_pct}%"
 
-printf " Done\n" >&2
+    printf " Done\n" >&2
+fi
 
 # === System-wide memory used + pressure (Activity Monitor Memory tab) ===
 memsys_bin="${0:A:h}/memsys"
@@ -356,7 +365,7 @@ for pid in $pids; do
 
     # Valid JSON output (one line per process — pipe to `jq .` to beautify)
     cat <<EOF
-{"$proc_name": {"PID": $pid, "Mem": "${mem:-N/A}", "Mem Peak": "${mem_peak:-N/A}", "RSS": "${rss:-N/A}", "CPU%": "${cpu_pct}%", "NCPU%": "${ncpu_pct}%"}, "Total": {"CPU Power": "${cpu_power:-N/A}", "GPU Power": "${gpu_power:-N/A}", "GPU%": "${gpu_pct:-N/A}%", "Mem BW": "${membw:-N/A} GB/s", "Mem BW Max": "${membw_max:-N/A} GB/s", "Mem Used": "${mem_used:-N/A}", "Mem Pressure": "${mem_pressure:-N/A}", "Mem Free%": "${mem_free_pct:-N/A}"}}
+{"$proc_name": {"PID": $pid, "Mem": "${mem:-N/A}", "Mem Peak": "${mem_peak:-N/A}", "RSS": "${rss:-N/A}", "CPU%": "${cpu_pct}%", "NCPU%": "${ncpu_pct}%"}, "Total": {"CPU Power": "${cpu_power:-N/A}", "GPU Power": "${gpu_power:-N/A}", "GPU%": "${gpu_pct:-N/A}", "Mem BW": "${membw:-N/A} GB/s", "Mem BW Max": "${membw_max:-N/A} GB/s", "Mem Used": "${mem_used:-N/A}", "Mem Pressure": "${mem_pressure:-N/A}", "Mem Free%": "${mem_free_pct:-N/A}"}}
 EOF
 
 done
