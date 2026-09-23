@@ -22,7 +22,7 @@
 #
 #   {"<comm>": {"PID": N, "Mem": "..", "Mem Peak": "..", "RSS": "..",
 #               "CPU%": "..", "NCPU%": ".."},
-#    "Total": {"CPU Power": "..", "GPU Power": "..", "GPU%": "..",
+#    "Total": {"GPU Power": "..", "GPU%": "..",
 #              "Mem BW": "..", "Mem BW Max": "..",
 #              "Mem Used": "..", "Mem Pressure": "..", "Mem Free%": ".."}}
 #
@@ -41,11 +41,12 @@
 #   NCPU%       CPU% normalized by logical core count (hw.ncpu): CPU% / ncpu.
 #               Caps at ~100% = the process is using the entire machine.
 #   Total       System-wide metrics, sampled ONCE per invocation:
-#     CPU Power   Package CPU power draw (powermetrics). N/A when
-#                 MEMPLUS_POWER=0, which skips the sudo sample.
-#     GPU Power   GPU power draw (powermetrics). N/A when MEMPLUS_POWER=0.
-#     GPU%        GPU HW active residency (powermetrics). N/A when
-#                 MEMPLUS_POWER=0.
+#     GPU Power   GPU power from the IOReport "GPU Energy" channel (memgpu
+#                 helper, no sudo). The mJ "GPU" channel is the fallback when
+#                 "GPU Energy" does not move. N/A if memgpu is missing.
+#     GPU%        GPU HW active residency from IOReport GPUPH (memgpu). Same
+#                 residency powermetrics calls "GPU HW active residency".
+#                 N/A if memgpu is missing.
 #     Mem BW      DRAM read+write bandwidth in GB/s (membw helper, see below).
 #     Mem BW Max  Session high-water mark for Mem BW: the highest value seen
 #                 across repeated mem-plus runs. Persisted in
@@ -78,6 +79,13 @@
 # user client, so it cannot lock out smartctl the way a full mactop sample can.
 # Build once:
 #     clang -O2 -framework CoreFoundation -o membw membw.c
+#
+# GPU Power and GPU% come from memgpu (memgpu.c), also IOReport, also no sudo.
+# CPU package power is not reported: the Energy Model mJ counters behind
+# powermetrics' "CPU Power" are visible without root but do not advance, so
+# an unsudoed reading is a hard 0 W on a busy CPU. powermetrics is not called.
+# Build once:
+#     clang -O2 -framework CoreFoundation -o memgpu memgpu.c
 #
 # Why Mem comes from memfoot, not vmmap: vmmap walks every VM region via
 # task_read_for_pid + mach_vm_region_recurse to recompute the same headline
@@ -178,28 +186,24 @@
 #     while :; do date "+%Y%m%d-%H%M%S"; mem-plus "llama-server|python" | jq .; sleep 10; done
 #
 # sleep 10 is the recommended default (human-facing snapshot, not a profiler).
-# Each invocation already takes ~1.5–2 s (powermetrics 300 ms, membw 200 ms,
+# Each invocation already takes ~1.5–2 s (memgpu 300 ms, membw 200 ms,
 # top -l 2 -s 1 a full second), so the real period is ~12 s — well above XNU's
 # 1 s host_statistics64 cache window. 2–3 s only if you are watching a live
 # generation (GPU%/BW); 30–60 s for a babysitter; do not go under ~2 s unless
-# you drop top/powermetrics.
+# you drop top.
 #
 # The loop does NOT cache Mem Used (fresh memsys each iteration). If that
 # field looks glued across 10 s ticks, it is almost never loop state: either
 # %.2f GB really did not move (~11 MB/step), pgrep -f matched the watcher
 # itself and you are staring at a wall of identical Total blocks, or the
-# current sudo/powermetrics/top call hung (date printed, previous jq still
-# on screen). See README "Watching / Repeating" and "Why Mem Used can look
-# frozen in a watch loop".
+# current top call hung (date printed, previous jq still on screen). See
+# README "Watching / Repeating" and "Why Mem Used can look frozen in a
+# watch loop".
 #
 # -----------------------------------------------------------------------------
 # REQUIREMENTS / NOTES
 # -----------------------------------------------------------------------------
-#   * macOS (uses memfoot, powermetrics, ps -o comm/rss).
-#   * powermetrics needs sudo; it is called once per invocation. You may be
-#     prompted for your password (or configure passwordless sudo for it).
-#     MEMPLUS_POWER=0 skips that call. CPU Power, GPU Power, and GPU% then
-#     read N/A, and mem-plus does not ask for a password.
+#   * macOS (uses memfoot, memgpu, ps -o comm/rss). No sudo.
 #   * Mem / Mem Peak come from the bundled `memfoot` helper (memfoot.c), which
 #     must be compiled once: clang -O2 -o memfoot memfoot.c
 #     It reads phys_footprint via proc_pid_rusage (same source as Activity
@@ -212,6 +216,10 @@
 #     No sudo. Base M4 uses AMC Stats byte counters; M4 Pro / M4 Max use
 #     PMP histograms. If the membw binary is missing, "Mem BW" reads
 #     "N/A GB/s" and everything else still works.
+#   * GPU Power / GPU% come from `memgpu` (memgpu.c):
+#     clang -O2 -framework CoreFoundation -o memgpu memgpu.c
+#     No sudo. "GPU Energy" (nJ) for power, GPUPH residency for GPU%.
+#     If the binary is missing, those two fields read N/A.
 #   * jq is only needed if you want pretty output; the tool itself emits valid
 #     JSON without it.
 # =============================================================================
@@ -239,7 +247,6 @@ bw_interval=${MEMPLUS_BW_INTERVAL:-0.2}
 # histograms are used instead. It opens no disk/NVMe user client, so it does
 # NOT interfere with smartctl. Build once:
 #     clang -O2 -framework CoreFoundation -o membw membw.c
-# Sampled before powermetrics so a sudo password prompt cannot block it.
 membw_bin="${0:A:h}/membw"
 printf "Sampling memory bandwidth..." >&2
 if [ -x "$membw_bin" ]; then
@@ -248,23 +255,25 @@ if [ -x "$membw_bin" ]; then
 fi
 printf " Done\n" >&2
 
-# === Get system-wide power metrics ONCE ===
-# CPU package power comes from powermetrics and needs sudo.
-# MEMPLUS_POWER=0 skips that call; CPU Power, GPU Power, and GPU% read N/A.
-# Mem BW was sampled above, so this prompt does not gate it.
-cpu_power=""; gpu_power=""; gpu_pct=""
-if [[ ${MEMPLUS_POWER:-1} != 0 ]]; then
-    printf "Sampling power metrics..." >&2
-    power_data=$(sudo powermetrics --samplers cpu_power,gpu_power -i 300 -n 1 2>/dev/null)
-
-    # Robust parsing
-    cpu_power=$(echo "$power_data" | grep -E "CPU Power:" | head -1 | awk '{print $3 $4}')
-    gpu_pct=$(echo "$power_data" | grep -E "GPU HW active residency" | awk '{print $5}' | tr -d '%')
-    gpu_power=$(echo "$power_data" | grep -E "GPU Power:" | head -1 | awk '{print $3 $4}')
-    [[ -n "$gpu_pct" ]] && gpu_pct="${gpu_pct}%"
-
-    printf " Done\n" >&2
+# === GPU power and HW active residency (IOReport, no sudo) ===
+# memgpu prints "<milliwatts> <percent>". CPU package power is omitted: the
+# Energy Model mJ counters do not advance without root, so a reading would be
+# a false 0 W. See memgpu.c. Default window is 0.3 s (the old powermetrics
+# interval). Override with MEMPLUS_GPU_INTERVAL.
+gpu_power=""; gpu_pct=""
+memgpu_bin="${0:A:h}/memgpu"
+gpu_interval=${MEMPLUS_GPU_INTERVAL:-0.3}
+printf "Sampling GPU..." >&2
+if [ -x "$memgpu_bin" ]; then
+    read -r gpu_mw gpu_raw <<< "$("$memgpu_bin" "$gpu_interval" 2>/dev/null)"
+    if [[ "$gpu_mw" == <-> ]]; then
+        gpu_power="${gpu_mw}mW"
+    fi
+    if [[ "$gpu_raw" == <-> || "$gpu_raw" == <->.<-> ]]; then
+        gpu_pct="${gpu_raw}%"
+    fi
 fi
+printf " Done\n" >&2
 
 # === System-wide memory used + pressure (Activity Monitor Memory tab) ===
 memsys_bin="${0:A:h}/memsys"
@@ -365,7 +374,7 @@ for pid in $pids; do
 
     # Valid JSON output (one line per process — pipe to `jq .` to beautify)
     cat <<EOF
-{"$proc_name": {"PID": $pid, "Mem": "${mem:-N/A}", "Mem Peak": "${mem_peak:-N/A}", "RSS": "${rss:-N/A}", "CPU%": "${cpu_pct}%", "NCPU%": "${ncpu_pct}%"}, "Total": {"CPU Power": "${cpu_power:-N/A}", "GPU Power": "${gpu_power:-N/A}", "GPU%": "${gpu_pct:-N/A}", "Mem BW": "${membw:-N/A} GB/s", "Mem BW Max": "${membw_max:-N/A} GB/s", "Mem Used": "${mem_used:-N/A}", "Mem Pressure": "${mem_pressure:-N/A}", "Mem Free%": "${mem_free_pct:-N/A}"}}
+{"$proc_name": {"PID": $pid, "Mem": "${mem:-N/A}", "Mem Peak": "${mem_peak:-N/A}", "RSS": "${rss:-N/A}", "CPU%": "${cpu_pct}%", "NCPU%": "${ncpu_pct}%"}, "Total": {"GPU Power": "${gpu_power:-N/A}", "GPU%": "${gpu_pct:-N/A}", "Mem BW": "${membw:-N/A} GB/s", "Mem BW Max": "${membw_max:-N/A} GB/s", "Mem Used": "${mem_used:-N/A}", "Mem Pressure": "${mem_pressure:-N/A}", "Mem Free%": "${mem_free_pct:-N/A}"}}
 EOF
 
 done
