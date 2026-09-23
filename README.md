@@ -10,6 +10,7 @@ The `mem-plus` script runs as-is. Compile the bundled helpers once:
 clang -O2 -o memfoot memfoot.c
 clang -O2 -o memsys memsys.c
 clang -O2 -framework CoreFoundation -o membw membw.c
+clang -O2 -framework CoreFoundation -o memgpu memgpu.c
 ```
 If a helper is missing, only its fields read `N/A` — everything else still works:
 
@@ -18,8 +19,9 @@ If a helper is missing, only its fields read `N/A` — everything else still wor
 | `memfoot` | `Mem`, `Mem Peak` |
 | `memsys` | `Mem Used`, `Mem Pressure`, `Mem Free%` |
 | `membw` | `Mem BW` |
+| `memgpu` | `GPU Power`, `GPU%` |
 
-`powermetrics` needs `sudo` for CPU power, GPU power, and GPU%. Set `MEMPLUS_POWER=0` to skip that sample; those three fields then read `N/A` and mem-plus does not ask for a password. `membw` does not use sudo: base M4 reads AMC Stats byte counters as a normal user, and M4 Pro / M4 Max use PMP histograms.
+Nothing in mem-plus calls `sudo`. `membw` and `memgpu` read IOReport as a normal user. CPU package power is not in the snapshot: the Energy Model mJ counters behind powermetrics' "CPU Power" are visible without root but do not advance, so an unsudoed sample is 0 W on a busy CPU. GPU power and GPU% come from `memgpu` instead (see below).
 
 ## Usage
 ```
@@ -36,9 +38,6 @@ mem-plus mlx_lm.generate
 
 # Use pattern matching (passed to pgrep -f)
 mem-plus "llama-server|python"
-
-# Skip sudo powermetrics. CPU Power, GPU Power, and GPU% read N/A.
-MEMPLUS_POWER=0 mem-plus llama-server
 ```
 
 ## What It Prints
@@ -57,7 +56,6 @@ Each line looks like:
     "NCPU%": "14.8%"
   },
   "Total": {
-    "CPU Power": "5200mW",
     "GPU Power": "8100mW",
     "GPU%": "62.3%",
     "Mem BW": "17.4 GB/s",
@@ -78,9 +76,8 @@ Each line looks like:
 - `CPU%`: Instantaneous %CPU, htop-style. Measured with `top -l 2 -s 1` and reading the SECOND sample, which is a delta over a 1s interval. Sums across cores, so a process pinning N threads can exceed 100%. (See "Why CPU% Is Measured This Way" below.)
 - `NCPU%`: CPU% normalized by logical core count (hw.ncpu): CPU% / ncpu. Caps at ~100% = the process is using the entire machine.
 - `Total`: System-wide metrics, sampled ONCE per invocation:
-  - `CPU Power`: Package CPU power draw (powermetrics). `N/A` when `MEMPLUS_POWER=0`.
-  - `GPU Power`: GPU power draw (powermetrics). `N/A` when `MEMPLUS_POWER=0`.
-  - `GPU%`: GPU HW active residency (powermetrics). `N/A` when `MEMPLUS_POWER=0`.
+  - `GPU Power`: GPU power from IOReport `GPU Energy` (`memgpu`, no sudo). `N/A` when `memgpu` is missing.
+  - `GPU%`: GPU HW active residency from IOReport `GPUPH` (`memgpu`). Same residency powermetrics labels "GPU HW active residency". `N/A` when `memgpu` is missing.
   - `Mem BW`: DRAM read+write bandwidth in GB/s, measured over `MEMPLUS_BW_INTERVAL` seconds (default **0.2**; see "Memory Bandwidth" below).
   - `Mem BW Max`: Decaying high-water mark for `Mem BW` — the highest value seen, but it *forgets* a peak that hasn't been matched or beaten for `MEMPLUS_BW_WINDOW_SEC` seconds (default 900). Persisted in `/tmp/mem-plus-membw-max`; delete that file to reset it. See "Mem BW Max — the Decaying Peak" below.
   - `Mem Used`: System-wide RAM used — the "Memory Used" label in Activity Monitor. That label is physical RAM minus file-backed pages minus empty free pages. It is larger than App + Wired + Compressed: volatile purgeable pages stay in the label, and so does RAM `vm_stat` never assigns to a bucket. Cached Files is file-backed plus purgeable, so it is not the term subtracted here.
@@ -186,6 +183,27 @@ Why not shell out to mactop: a full mactop sample also opens the NVMe/disk IOKit
 
 If the `membw` binary isn't built/present, `Mem BW` reads `N/A GB/s` and everything else still works.
 
+## GPU Power and GPU% (the `memgpu` helper)
+`GPU Power` and `GPU%` used to come from `sudo powermetrics --samplers cpu_power,gpu_power`. That one call also produced CPU package power, and the CPU half cannot be read without root: on this base M4 (Mac16,10, macOS 27) the Energy Model channels `CPU Energy`, `ECPU`, and `PCPU` (unit mJ) keep a large cumulative total and a **zero delta** across a full-core burn. mactop reports that as `cpu_power = 0`. mem-plus drops the field rather than print a false idle.
+
+GPU does move without root. `memgpu` takes one IOReport window (`MEMPLUS_GPU_INTERVAL` seconds, default **0.3**) and prints milliwatts plus active percent:
+
+| Field | IOReport source | Notes |
+|-------|-----------------|-------|
+| `GPU Power` | Energy Model `GPU Energy` (nJ) | Used when its delta is non-zero. Idle on this M4 was ~0.1 W; a Metal compute burn read ~13 W, the same number mactop's `gpu_power` showed. |
+| `GPU Power` fallback | Energy Model `GPU` (mJ) | Used only when `GPU Energy` does not move and this one does. On macOS 27 this channel is frozen, which is the counter powermetrics has historically called GPU Power. |
+| `GPU%` | GPU Stats `GPUPH` | Residency outside `OFF` / `IDLE` / `DOWN`. `BSTGPUPH` is the boost controller and is ignored — it can read 100% while `GPUPH` is mostly OFF. |
+
+`GPU SRAM`, DRAM, and ANE energy are the same frozen mJ counters, so `GPU Power` is the GPU energy-model term, not whole-package power. SMC `PSTR` (mactop's system power) sees a larger rise under the same Metal load because it includes the rest of the machine.
+
+`memgpu` never opens a disk/NVMe user client, so it does not lock out `smartctl` the way a full mactop sample can. Build once:
+
+```bash
+clang -O2 -framework CoreFoundation -o memgpu memgpu.c
+```
+
+No sudo. If the binary is missing, `GPU Power` and `GPU%` read `N/A`.
+
 ## Mem BW Max — the Decaying Peak
 `Mem BW Max` is a high-water mark with a **time-decay**, so a one-off spike from long ago doesn't dominate forever. It is the highest `Mem BW` observed, but it forgets a peak that has not been matched or beaten for `MEMPLUS_BW_WINDOW_SEC` seconds (default **900**):
 ```bash
@@ -215,7 +233,7 @@ while :; do date "+%Y%m%d-%H%M%S"; mem-plus "llama-server|python" | jq .; sleep 
 
 `sleep 10` is the recommended default for a **human-facing snapshot**, not a high-resolution profiler.
 
-Each `mem-plus` already burns about **1.5–2 s** of wall time before the sleep (`powermetrics` 300 ms, `membw` 200 ms, `top -l 2 -s 1` a full second). So a `sleep 10` loop is really sampling about every **12 s**. That is well above XNU's **1 s** `host_statistics64` cache window, so `Mem Used` will not freeze because of that cache.
+Each `mem-plus` already burns about **1.5–2 s** of wall time before the sleep (`memgpu` 300 ms, `membw` 200 ms, `top -l 2 -s 1` a full second). So a `sleep 10` loop is really sampling about every **12 s**. That is well above XNU's **1 s** `host_statistics64` cache window, so `Mem Used` will not freeze because of that cache.
 
 **10 s is a good fit for:**
 
@@ -228,7 +246,7 @@ Each `mem-plus` already burns about **1.5–2 s** of wall time before the sleep 
 - `Mem BW` — each sample is only a **0.2 s** window, then you wait 10 s. Prefill spikes are easy to miss. `Mem BW Max` exists for that, but with this duty cycle it is a lottery, not a peak meter. Keep the loop interval well under `MEMPLUS_BW_WINDOW_SEC` (default 900) so a *busy* workload still has a chance to refresh the mark before it decays.
 - `CPU%` / `GPU%` / power — one short snapshot per cycle. A decode that lasts a few seconds can land entirely between samples.
 
-**Other intervals:** drop to **2–3 s** only if you are watching a live generation and care about GPU%/BW. Go to **30–60 s** if it is just a babysitter. Do not go under ~2 s unless you drop `top`/`powermetrics`; you would spend more time sampling than watching, and you would start colliding with the 1 s kernel cache.
+**Other intervals:** drop to **2–3 s** only if you are watching a live generation and care about GPU%/BW. Go to **30–60 s** if it is just a babysitter. Do not go under ~2 s unless you drop `top`; you would spend more time sampling than watching, and you would start colliding with the 1 s kernel cache.
 
 ### Why `Mem Used` can look frozen in a watch loop
 A `while` loop does **not** hold `Mem Used`. Each iteration is a new `mem-plus` → new `memsys` process. There is no loop-local cache for that field (the only `/tmp` state is `Mem BW Max`). Killing the loop and starting another one does not flush a bash cache; it just takes a new kernel sample after a pause.
@@ -241,14 +259,14 @@ If a 10 s loop *looks* stuck, it is almost always one of these:
 
 1. **The rounded number really did not move.** Dual-serve idle can sit on the same hundredths digit for a long time. Per-process `Mem` (Metal / `phys_footprint` via `memfoot`) can still change. `Mem Used` will not, until file-backed or empty-free pages move by ~11 MB.
 2. **A wall of identical `Total` blocks.** `pgrep -f` is a regex on the full command line. A pattern like `llama-server|python` matches the servers, **and** `mem-plus` itself (the pattern is on its argv), `sudo mem-plus …`, and a parent shell whose command line contains that string. Every JSON line repeats the same `Total.Mem Used`. Easy to eye-lock on an old block; a new loop puts a fresh block at the cursor.
-3. **A hung iteration, not a stale sampler.** If you print `date` *before* `mem-plus` and that `sudo mem-plus` blocks (sudo password after the 5-minute timestamp, `powermetrics`, or `top -l 2 -s 1`), you get a new timestamp and the previous jq blob still on screen. Ctrl-C kills the stuck child; the next run completes and looks like a refresh. Check stderr: you should see `Sampling power metrics...` finish with `Done` each cycle.
+3. **A hung iteration, not a stale sampler.** If you print `date` *before* `mem-plus` and that run blocks in `top -l 2 -s 1`, you get a new timestamp and the previous jq blob still on screen. Ctrl-C kills the stuck child; the next run completes and looks like a refresh. Check stderr: you should see `Sampling GPU...` and `Sampling memory bandwidth...` finish with `Done` each cycle.
 
 **Diagnostic:** `Mem Free%` / `Mem Pressure` come from `memorystatus_get_level()`, which is **not** the `host_statistics64` cache. If those two were moving while `Mem Used` was glued, that is the 1 s kernel cache. If the date froze too, `mem-plus` never finished. Compare `memsys` to `vm_stat` on the same tick (`hw.memsize` minus file-backed pages minus "Pages free"): if `vm_stat` moved and `memsys` did not, it is the rate-limit cache.
 
 ## Requirements / Notes
-- macOS on Apple Silicon (uses `memfoot`, `memsys`, powermetrics, ps -o comm/rss, and IOReport for bandwidth).
-- powermetrics needs sudo; it is called once per invocation unless `MEMPLUS_POWER=0`. You may be prompted for your password (or configure passwordless sudo for it). With `MEMPLUS_POWER=0`, CPU Power, GPU Power, and GPU% read `N/A` and there is no password prompt.
+- macOS on Apple Silicon (uses `memfoot`, `memsys`, `memgpu`, ps -o comm/rss, and IOReport for bandwidth and GPU power). No sudo.
 - `Mem` / `Mem Peak` require the bundled `memfoot` helper (`clang -O2 -o memfoot memfoot.c`). It reads `phys_footprint` via `proc_pid_rusage` and does not walk VM regions like `vmmap`, so it won't hitch live apps.
 - `Mem Used` / `Mem Pressure` / `Mem Free%` require `memsys` (`clang -O2 -o memsys memsys.c`).
+- `GPU Power` / `GPU%` require `memgpu` (`clang -O2 -framework CoreFoundation -o memgpu memgpu.c`). No sudo: `GPU Energy` for power, `GPUPH` for active residency. CPU package power is not reported.
 - The `Mem BW` fields require the bundled `membw` helper (`clang -O2 -framework CoreFoundation -o membw membw.c`). No sudo: base M4 uses AMC Stats byte counters, M4 Pro / M4 Max use PMP histograms. Compiled binaries are gitignored — only the `.c` sources are tracked. If missing, those fields read `N/A`.
 - jq is only needed if you want pretty output; the tool itself emits valid JSON without it.
