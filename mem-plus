@@ -48,9 +48,10 @@
 #     Mem BW Max  Session high-water mark for Mem BW: the highest value seen
 #                 across repeated mem-plus runs. Persisted in
 #                 /tmp/mem-plus-membw-max; delete that file to reset it.
-#     Mem Used    System-wide RAM used (memsys helper). Activity Monitor Memory
-#                 tab "Memory Used": wire + (internal - purgeable) + compressor.
-#                 Purgeable and file-backed pages are Cached Files, not used.
+#     Mem Used    System-wide RAM used (memsys helper). The "Memory Used" label
+#                 in Activity Monitor: physical - file-backed - empty free.
+#                 That is larger than App + Wired + Compressed. Cached Files
+#                 already includes purgeable pages, and the label still counts them.
 #     Mem Pressure System memory pressure: Normal, Warn, or Critical — derived
 #                 from memorystatus_get_level() free % (AM's pressure graph).
 #     Mem Free%   Percent of RAM available (memorystatus_get_level; same as
@@ -85,8 +86,8 @@
 #     clang -O2 -o memfoot memfoot.c
 #
 # System Mem Used / Pressure / Free% come from memsys (memsys.c):
-# wire + (internal - purgeable) + compressor for Memory Used (Activity Monitor's
-# App + Wired + Compressed), memorystatus_get_level() for free % / pressure.
+# hw.memsize - file-backed - empty free for the Memory Used label,
+# memorystatus_get_level() for free % / pressure.
 # Build once:
 #     clang -O2 -o memsys memsys.c
 #

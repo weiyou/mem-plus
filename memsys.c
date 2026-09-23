@@ -6,13 +6,18 @@
 //     <memory_used_GB> <pressure_label> <free_percent>
 // e.g. "8.61 Normal 80.0"
 //
-// Memory Used matches Activity Monitor's "Memory Used" (App + Wired + Compressed):
-//     (wire_count + (internal_page_count - purgeable_count) + compressor_page_count)
-//         * page_size
-// App Memory is anonymous pages minus volatile purgeable pages. Activity Monitor
-// counts those purgeable pages with Cached Files, not Memory Used. wire_count
-// is Wired, compressor_page_count is Compressed. File-backed pages
-// (external_page_count) stay out — AM lists them as Cached Files.
+// Memory Used matches the "Memory Used" label in Activity Monitor, not the sum
+// of the three lines under it. Those lines are App + Wired + Compressed, and
+// App Memory has volatile purgeable pages removed. The label is larger:
+//
+//     hw.memsize - external_page_count * page_size
+//                - (free_count - speculative_count) * page_size
+//
+// external_page_count is file-backed pages. Cached Files is that plus purgeable,
+// so subtracting Cached Files would drop purgeable pages the label still counts.
+// free_count already includes speculative pages; vm_stat's "Pages free" does not.
+// The result equals App + Wired + Compressed + purgeable + the physical pages
+// vm_stat never assigns to a bucket (firmware and other carveouts).
 //
 // Free % comes from memorystatus_get_level() — the same API memory_pressure(1)
 // uses for "System-wide memory free percentage" (NOT raw free_count/total_pages).
@@ -44,6 +49,7 @@
 #include <mach/mach_types.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 extern int memorystatus_get_level(user_addr_t level);
@@ -69,16 +75,25 @@ int main(void) {
         return 1;
     }
 
+    uint64_t memsize = 0;
+    size_t memsize_len = sizeof(memsize);
+    if (sysctlbyname("hw.memsize", &memsize, &memsize_len, NULL, 0) != 0 ||
+        memsize == 0) {
+        fprintf(stderr, "memsys: hw.memsize failed\n");
+        return 1;
+    }
+
     uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
-    /* Volatile purgeable pages sit inside internal_page_count. AM moves them
-       into Cached Files, so Memory Used must not include them. */
-    uint64_t app_pages = vm.internal_page_count;
-    if (vm.purgeable_count < app_pages)
-        app_pages -= vm.purgeable_count;
+    /* vm.free_count includes speculative pages. Activity Monitor's empty-free
+       term, and vm_stat's "Pages free", are free_count - speculative_count. */
+    uint64_t free_pages = vm.free_count;
+    if (vm.speculative_count < free_pages)
+        free_pages -= vm.speculative_count;
     else
-        app_pages = 0;
-    uint64_t used_pages = vm.wire_count + app_pages + vm.compressor_page_count;
-    double used_gb = (double)(used_pages * page) / (1024.0 * 1024.0 * 1024.0);
+        free_pages = 0;
+    uint64_t aside = ((uint64_t)vm.external_page_count + free_pages) * page;
+    uint64_t used = (memsize > aside) ? memsize - aside : 0;
+    double used_gb = (double)used / (1024.0 * 1024.0 * 1024.0);
 
     printf("%.2f %s %.1f\n", used_gb, pressure_from_percent(free_pct),
            (double)free_pct);
