@@ -19,7 +19,7 @@ If a helper is missing, only its fields read `N/A` — everything else still wor
 | `memsys` | `Mem Used`, `Mem Pressure`, `Mem Free%` |
 | `membw` | `Mem BW` |
 
-`powermetrics` always needs `sudo` (CPU power). `membw` does not: base M4 reads AMC Stats byte counters as a normal user, and M4 Pro / M4 Max use PMP histograms.
+`powermetrics` needs `sudo` for CPU power, GPU power, and GPU%. Set `MEMPLUS_POWER=0` to skip that sample; those three fields then read `N/A` and mem-plus does not ask for a password. `membw` does not use sudo: base M4 reads AMC Stats byte counters as a normal user, and M4 Pro / M4 Max use PMP histograms.
 
 ## Usage
 ```
@@ -36,6 +36,9 @@ mem-plus mlx_lm.generate
 
 # Use pattern matching (passed to pgrep -f)
 mem-plus "llama-server|python"
+
+# Skip sudo powermetrics. CPU Power, GPU Power, and GPU% read N/A.
+MEMPLUS_POWER=0 mem-plus llama-server
 ```
 
 ## What It Prints
@@ -75,9 +78,9 @@ Each line looks like:
 - `CPU%`: Instantaneous %CPU, htop-style. Measured with `top -l 2 -s 1` and reading the SECOND sample, which is a delta over a 1s interval. Sums across cores, so a process pinning N threads can exceed 100%. (See "Why CPU% Is Measured This Way" below.)
 - `NCPU%`: CPU% normalized by logical core count (hw.ncpu): CPU% / ncpu. Caps at ~100% = the process is using the entire machine.
 - `Total`: System-wide metrics, sampled ONCE per invocation:
-  - `CPU Power`: Package CPU power draw (powermetrics).
-  - `GPU Power`: GPU power draw (powermetrics).
-  - `GPU%`: GPU HW active residency (powermetrics).
+  - `CPU Power`: Package CPU power draw (powermetrics). `N/A` when `MEMPLUS_POWER=0`.
+  - `GPU Power`: GPU power draw (powermetrics). `N/A` when `MEMPLUS_POWER=0`.
+  - `GPU%`: GPU HW active residency (powermetrics). `N/A` when `MEMPLUS_POWER=0`.
   - `Mem BW`: DRAM read+write bandwidth in GB/s, measured over `MEMPLUS_BW_INTERVAL` seconds (default **0.2**; see "Memory Bandwidth" below).
   - `Mem BW Max`: Decaying high-water mark for `Mem BW` — the highest value seen, but it *forgets* a peak that hasn't been matched or beaten for `MEMPLUS_BW_WINDOW_SEC` seconds (default 900). Persisted in `/tmp/mem-plus-membw-max`; delete that file to reset it. See "Mem BW Max — the Decaying Peak" below.
   - `Mem Used`: System-wide RAM used — the "Memory Used" label in Activity Monitor. That label is physical RAM minus file-backed pages minus empty free pages. It is larger than App + Wired + Compressed: volatile purgeable pages stay in the label, and so does RAM `vm_stat` never assigns to a bucket. Cached Files is file-backed plus purgeable, so it is not the term subtracted here.
@@ -244,7 +247,7 @@ If a 10 s loop *looks* stuck, it is almost always one of these:
 
 ## Requirements / Notes
 - macOS on Apple Silicon (uses `memfoot`, `memsys`, powermetrics, ps -o comm/rss, and IOReport for bandwidth).
-- powermetrics needs sudo; it is called once per invocation. You may be prompted for your password (or configure passwordless sudo for it).
+- powermetrics needs sudo; it is called once per invocation unless `MEMPLUS_POWER=0`. You may be prompted for your password (or configure passwordless sudo for it). With `MEMPLUS_POWER=0`, CPU Power, GPU Power, and GPU% read `N/A` and there is no password prompt.
 - `Mem` / `Mem Peak` require the bundled `memfoot` helper (`clang -O2 -o memfoot memfoot.c`). It reads `phys_footprint` via `proc_pid_rusage` and does not walk VM regions like `vmmap`, so it won't hitch live apps.
 - `Mem Used` / `Mem Pressure` / `Mem Free%` require `memsys` (`clang -O2 -o memsys memsys.c`).
 - The `Mem BW` fields require the bundled `membw` helper (`clang -O2 -framework CoreFoundation -o membw membw.c`). No sudo: base M4 uses AMC Stats byte counters, M4 Pro / M4 Max use PMP histograms. Compiled binaries are gitignored — only the `.c` sources are tracked. If missing, those fields read `N/A`.
