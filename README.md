@@ -80,7 +80,7 @@ Each line looks like:
   - `GPU%`: GPU HW active residency (powermetrics).
   - `Mem BW`: DRAM read+write bandwidth in GB/s, measured over `MEMPLUS_BW_INTERVAL` seconds (default **0.2**; see "Memory Bandwidth" below).
   - `Mem BW Max`: Decaying high-water mark for `Mem BW` — the highest value seen, but it *forgets* a peak that hasn't been matched or beaten for `MEMPLUS_BW_WINDOW_SEC` seconds (default 900). Persisted in `/tmp/mem-plus-membw-max`; delete that file to reset it. See "Mem BW Max — the Decaying Peak" below.
-  - `Mem Used`: System-wide RAM used — Activity Monitor's "Memory Used" (`App + Wired + Compressed`; cached files excluded).
+  - `Mem Used`: System-wide RAM used — Activity Monitor's "Memory Used" (`App + Wired + Compressed`). App Memory is anonymous pages minus volatile purgeable pages; purgeable and file-backed pages are Cached Files and are excluded.
   - `Mem Pressure`: `Normal`, `Warn`, or `Critical` — derived from `memorystatus_get_level()` free % (Activity Monitor's pressure graph).
   - `Mem Free%`: Percent of RAM available (same API as `memory_pressure(1)`'s "System-wide memory free percentage").
 
@@ -144,7 +144,7 @@ If the `memfoot` binary isn't built/present, `Mem` / `Mem Peak` read `N/A` and e
 ## System Memory (the `memsys` helper)
 Activity Monitor's Memory tab shows two headline figures mem-plus now mirrors in `Total`:
 
-- **Memory Used** → `Mem Used` — `(wire_count + internal_page_count + compressor_page_count) × page_size`, matching App + Wired + Compressed (`internal` ≈ App, `compressor_page_count` = Compressed). Cached file memory is *not* included (AM lists that separately).
+- **Memory Used** → `Mem Used` — `(wire_count + (internal_page_count - purgeable_count) + compressor_page_count) × page_size`, matching App + Wired + Compressed. App Memory is anonymous pages minus volatile purgeable pages; Activity Monitor counts those purgeable pages with Cached Files. File-backed pages (`external_page_count`) are also excluded.
 - **Memory Pressure** → `Mem Pressure` + `Mem Free%` — from `memorystatus_get_level()` (the same call `memory_pressure(1)` uses). Pressure labels use Apple's documented thresholds: ≥ 60% free = Normal, ≥ 30% = Warn, else Critical. The `kern.memorystatus_vm_pressure_level` sysctl lags and is not used.
 
 Build once:
