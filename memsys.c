@@ -2,9 +2,13 @@
 // memsys - system memory used + pressure (Activity Monitor Memory tab)
 // =============================================================================
 //
-// Prints three fields on one line:
-//     <memory_used_GB> <pressure_label> <free_percent>
-// e.g. "8.61 Normal 80.0"
+// Prints four fields on one line:
+//     <memory_used_GB> <pressure_label> <free_percent> <swap_used>
+// e.g. "8.61 Normal 80.0 2.04 GB"
+//
+// Swap used is vm.swapusage xsu_used (bytes) — Activity Monitor's "Swap Used".
+// 1024-based, two decimal places: MB below 1 GB, GB at or above. "N/A" if
+// vm.swapusage cannot be read. The other three fields still print.
 //
 // Memory Used matches the "Memory Used" label in Activity Monitor, not the sum
 // of the three lines under it. Those lines are App + Wired + Compressed, and
@@ -39,6 +43,7 @@
 //     clang -O2 -o memsys memsys.c
 //
 // Units: Mem Used is 1024-based (GiB), labeled GB like Activity Monitor.
+// Mem Swap is 1024-based too: MB below 1 GB, GB at or above.
 //
 // Usage:
 //     memsys
@@ -58,6 +63,17 @@ static const char *pressure_from_percent(unsigned int pct) {
     if (pct >= 60) return "Normal";
     if (pct >= 30) return "Warn";
     return "Critical";
+}
+
+/* xsu_used is bytes, matching sysctl's "used" figure, not a page count. */
+static void format_swap(uint64_t bytes, char *buf, size_t len) {
+    const double gb = 1024.0 * 1024.0 * 1024.0;
+    const double mb = 1024.0 * 1024.0;
+
+    if (bytes >= (uint64_t)gb)
+        snprintf(buf, len, "%.2f GB", (double)bytes / gb);
+    else
+        snprintf(buf, len, "%.2f MB", (double)bytes / mb);
 }
 
 int main(void) {
@@ -95,7 +111,15 @@ int main(void) {
     uint64_t used = (memsize > aside) ? memsize - aside : 0;
     double used_gb = (double)used / (1024.0 * 1024.0 * 1024.0);
 
-    printf("%.2f %s %.1f\n", used_gb, pressure_from_percent(free_pct),
-           (double)free_pct);
+    char swap_buf[32];
+    struct xsw_usage xsu;
+    size_t xsu_len = sizeof(xsu);
+    if (sysctlbyname("vm.swapusage", &xsu, &xsu_len, NULL, 0) != 0)
+        snprintf(swap_buf, sizeof(swap_buf), "N/A");
+    else
+        format_swap(xsu.xsu_used, swap_buf, sizeof(swap_buf));
+
+    printf("%.2f %s %.1f %s\n", used_gb, pressure_from_percent(free_pct),
+           (double)free_pct, swap_buf);
     return 0;
 }

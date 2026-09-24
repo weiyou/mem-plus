@@ -14,10 +14,10 @@
 // Build:
 //     clang -O2 -o memfoot memfoot.c
 //
-// Units: 1024-based (MiB/GiB), labeled M/G like Activity Monitor.
+// Units: 1024-based (KiB/MiB/GiB), labeled KB/MB/GB like Activity Monitor.
 //
 // Usage:
-//     memfoot <pid>     # prints: "<footprint> <peak>"  (e.g. "729.0M 1.1G")
+//     memfoot <pid>     # prints: "<footprint> <peak>"  (e.g. "729.0 MB 1.1 GB")
 // =============================================================================
 
 #include <libproc.h>
@@ -30,11 +30,11 @@ static void format_bytes(uint64_t bytes, char *buf, size_t len) {
     const double mb = 1024.0 * 1024.0;
 
     if (bytes >= (uint64_t)gb)
-        snprintf(buf, len, "%.1fG", (double)bytes / gb);
+        snprintf(buf, len, "%.1f GB", (double)bytes / gb);
     else if (bytes >= (uint64_t)mb)
-        snprintf(buf, len, "%.1fM", (double)bytes / mb);
+        snprintf(buf, len, "%.1f MB", (double)bytes / mb);
     else
-        snprintf(buf, len, "%.1fK", (double)bytes / 1024.0);
+        snprintf(buf, len, "%.1f KB", (double)bytes / 1024.0);
 }
 
 int main(int argc, char **argv) {
