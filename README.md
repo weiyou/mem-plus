@@ -5,7 +5,16 @@
 A macOS utility that prints a compact, machine-readable snapshot of memory, CPU, and power usage for running processes — handy for watching local inference servers like llama.cpp and MLX.
 
 ## Setup
-The `mem-plus` script runs as-is. Compile the bundled helpers once:
+`make` builds the four helpers in this directory. `make install` copies `mem-plus` and those helpers into a directory you name. The script looks for the helpers next to itself, so they are installed together. `bindir` has no default; leaving it out is an error.
+
+```bash
+make
+make install bindir=/path/to/dir
+```
+
+A leading `~` is expanded, so `make install bindir=~/bin` installs into your home `bin` directory.
+
+The Makefile compiles with `clang -O2` unless `CC` or `CFLAGS` is set:
 ```bash
 clang -O2 -o memfoot memfoot.c
 clang -O2 -o memsys memsys.c
@@ -17,7 +26,7 @@ If a helper is missing, only its fields read `N/A` — everything else still wor
 | Missing helper | Fields that read `N/A` |
 |---|---|
 | `memfoot` | `Mem`, `Mem Peak` |
-| `memsys` | `Mem Used`, `Mem Pressure`, `Mem Free%` |
+| `memsys` | `Mem Used`, `Mem Pressure`, `Mem Free%`, `Mem Swap` |
 | `membw` | `Mem BW` |
 | `memgpu` | `GPU Power`, `GPU%` |
 
@@ -25,11 +34,16 @@ Nothing in mem-plus calls `sudo`. `membw` and `memgpu` read IOReport as a normal
 
 ## Usage
 ```
-mem-plus <process-name-or-pattern>
+mem-plus [process-name-or-pattern]
 ```
+
+With no argument, or when the pattern matches no process, mem-plus prints one JSON line containing only the system `Total` block. It still samples GPU power and memory bandwidth, and it does not run `top`.
 
 ### Examples:
 ```bash
+# System totals only
+mem-plus
+
 # Get info for llama-server process
 mem-plus llama-server
 
@@ -41,16 +55,16 @@ mem-plus "llama-server|python"
 ```
 
 ## What It Prints
-One JSON object PER MATCHING PROCESS, each on a single line. The single-line format is intentional so the output is easy to grep, pipe, and append to logs.
+One JSON object PER MATCHING PROCESS, each on a single line. The single-line format is intentional so the output is easy to grep, pipe, and append to logs. With no pattern, or when nothing matches, the line is only the `Total` object.
 
-Each line looks like:
+Each process line looks like:
 
 ```json
 {
   "<comm>": {
     "PID": 12345,
-    "Mem": "845.5M",
-    "Mem Peak": "912.0M",
+    "Mem": "845.5 MB",
+    "Mem Peak": "912.0 MB",
     "RSS": "3098.3 MB",
     "CPU%": "142.0%",
     "NCPU%": "14.8%"
@@ -60,9 +74,10 @@ Each line looks like:
     "GPU%": "62.3%",
     "Mem BW": "17.4 GB/s",
     "Mem BW Max": "42.1 GB/s",
-    "Mem Used": "8.61 GB",
+    "Mem Free%": "80.0%",
     "Mem Pressure": "Normal",
-    "Mem Free%": "80.0%"
+    "Mem Swap": "2.04 GB",
+    "Mem Used": "8.61 GB"
   }
 }
 ```
@@ -70,8 +85,8 @@ Each line looks like:
 ## Fields Explanation
 - `<comm>`: Last 80 chars of the process command path (the JSON key).
 - `PID`: Process id.
-- `Mem`: Physical footprint (`memfoot` helper / `proc_pid_rusage`). What Activity Monitor calls "Memory". The number you should trust for real RAM cost.
-- `Mem Peak`: Peak physical footprint since the process started.
+- `Mem`: Physical footprint (`memfoot` helper / `proc_pid_rusage`). What Activity Monitor calls "Memory". The number you should trust for real RAM cost. 1024-based, labeled `KB` under 1 MB, `MB` under 1 GB, and `GB` at or above.
+- `Mem Peak`: Peak physical footprint since the process started. Same units as `Mem`.
 - `RSS`: Resident Set Size (ps -o rss), in MB. A cross-check metric; see "RSS vs Mem" below for why it can differ wildly.
 - `CPU%`: Instantaneous %CPU, htop-style. Measured with `top -l 2 -s 1` and reading the SECOND sample, which is a delta over a 1s interval. Sums across cores, so a process pinning N threads can exceed 100%. (See "Why CPU% Is Measured This Way" below.)
 - `NCPU%`: CPU% normalized by logical core count (hw.ncpu): CPU% / ncpu. Caps at ~100% = the process is using the entire machine.
@@ -80,18 +95,23 @@ Each line looks like:
   - `GPU%`: GPU HW active residency from IOReport `GPUPH` (`memgpu`). Same residency powermetrics labels "GPU HW active residency". `N/A` when `memgpu` is missing.
   - `Mem BW`: DRAM read+write bandwidth in GB/s, measured over `MEMPLUS_BW_INTERVAL` seconds (default **0.2**; see "Memory Bandwidth" below).
   - `Mem BW Max`: Decaying high-water mark for `Mem BW` — the highest value seen, but it *forgets* a peak that hasn't been matched or beaten for `MEMPLUS_BW_WINDOW_SEC` seconds (default 900). Persisted in `/tmp/mem-plus-membw-max`; delete that file to reset it. See "Mem BW Max — the Decaying Peak" below.
-  - `Mem Used`: System-wide RAM used — the "Memory Used" label in Activity Monitor. That label is physical RAM minus file-backed pages minus empty free pages. It is larger than App + Wired + Compressed: volatile purgeable pages stay in the label, and so does RAM `vm_stat` never assigns to a bucket. Cached Files is file-backed plus purgeable, so it is not the term subtracted here.
-  - `Mem Pressure`: `Normal`, `Warn`, or `Critical` — derived from `memorystatus_get_level()` free % (Activity Monitor's pressure graph).
   - `Mem Free%`: Percent of RAM available (same API as `memory_pressure(1)`'s "System-wide memory free percentage").
+  - `Mem Pressure`: `Normal`, `Warn`, or `Critical` — derived from `memorystatus_get_level()` free % (Activity Monitor's pressure graph).
+  - `Mem Swap`: Swap used — Activity Monitor's "Swap Used", from `vm.swapusage` (`xsu_used`, bytes). 1024-based, two decimal places: `MB` below 1 GB, `GB` at or above.
+  - `Mem Used`: System-wide RAM used — the "Memory Used" label in Activity Monitor. That label is physical RAM minus file-backed pages minus empty free pages. It is larger than App + Wired + Compressed: volatile purgeable pages stay in the label, and so does RAM `vm_stat` never assigns to a bucket. Cached Files is file-backed plus purgeable, so it is not the term subtracted here.
+
+`Total` keys are emitted in that alphabetical order.
 
 Note: the "Total" block is system-wide (a single sample), not per-process, so it repeats identically on every process line.
 
 ## Units (GB vs GiB)
-Memory **sizes** (`Mem`, `Mem Peak`, `Mem Used`, `RSS`) are computed with **1024-based divisors** (MiB/GiB per IEC). They are labeled **MB** / **GB** anyway — the same convention Activity Monitor, `top`, `vmmap`, and `footprint` use — so you can compare numbers directly without converting.
+Memory **sizes** (`Mem`, `Mem Peak`, `Mem Swap`, `Mem Used`, `RSS`) are computed with **1024-based divisors** (KiB/MiB/GiB per IEC). They are labeled **KB** / **MB** / **GB** anyway — the same convention Activity Monitor, `top`, `vmmap`, and `footprint` use — so you can compare numbers directly without converting.
 
 | Field | Divisor | Label | Compare with |
 |-------|---------|-------|--------------|
-| `Mem`, `Mem Peak`, `Mem Used` | 1024³ | `G` / `GB` | Activity Monitor memory columns |
+| `Mem`, `Mem Peak` | 1024 below 1 MB, 1024² below 1 GB, else 1024³ | `KB` / `MB` / `GB` | Activity Monitor memory columns |
+| `Mem Swap` | 1024² below 1 GB, else 1024³ | `MB` / `GB` | Activity Monitor "Swap Used" |
+| `Mem Used` | 1024³ | `GB` | Activity Monitor "Memory Used" |
 | `RSS` | 1024² | `MB` | `ps` / AM (same basis) |
 | `Mem BW` | 10⁹ | `GB/s` | Throughput convention (`membw`, mactop); **not** 1024-based |
 
@@ -106,8 +126,8 @@ These two numbers measure different things, and different inference engines stre
 
 Real data from this tool:
 
-- llama-server → "Mem": "845.5M", "RSS": "3098.3 MB" (RSS >> Mem)
-- mlx_lm python → "Mem": "7.4G", "RSS": "1789.4 MB" (Mem >> RSS)
+- llama-server → "Mem": "845.5 MB", "RSS": "3098.3 MB" (RSS >> Mem)
+- mlx_lm python → "Mem": "7.4 GB", "RSS": "1789.4 MB" (Mem >> RSS)
 
 Why each diverges:
 
@@ -142,10 +162,11 @@ clang -O2 -o memfoot memfoot.c
 If the `memfoot` binary isn't built/present, `Mem` / `Mem Peak` read `N/A` and everything else still works.
 
 ## System Memory (the `memsys` helper)
-Activity Monitor's Memory tab shows two headline figures mem-plus now mirrors in `Total`:
+Activity Monitor's Memory tab shows headline figures mem-plus mirrors in `Total`:
 
 - **Memory Used** → `Mem Used` — `hw.memsize − external_page_count × page_size − (free_count − speculative_count) × page_size`.
 - **Memory Pressure** → `Mem Pressure` + `Mem Free%` — from `memorystatus_get_level()` (the same call `memory_pressure(1)` uses). Pressure labels use Apple's documented thresholds: ≥ 60% free = Normal, ≥ 30% = Warn, else Critical. The `kern.memorystatus_vm_pressure_level` sysctl lags and is not used.
+- **Swap Used** → `Mem Swap` — `vm.swapusage` `xsu_used` (bytes). 1024-based, two decimal places: `MB` below 1 GB, `GB` at or above. On a machine whose `sysctl vm.swapusage` says `used = 2085.31M`, this field reads `2.04 GB`.
 
 The bullet beside "Memory Used" looks like a sum of App Memory, Wired Memory, and Compressed. The label is a different total: physical RAM that is neither file-backed nor empty. `free_count` already includes speculative pages, so the empty term is `free_count − speculative_count`, the same quantity `vm_stat` prints as "Pages free". Cached Files is file-backed pages plus volatile purgeable pages, so those purgeable pages stay in the label. So does the part of `hw.memsize` that `vm_stat` never assigns to a bucket — about 0.5 GB on the 24 GB machine this was checked against. There the three lines added up to about 0.7 GB under the label (the purgeable slice, plus that unclassified 0.5 GB). `memsys` follows the label. Summing the three lines reports committed VM pages and leaves both of those out.
 
@@ -154,7 +175,7 @@ Build once:
 clang -O2 -o memsys memsys.c
 ```
 
-No `sudo` required. If the binary is missing, those three fields read `N/A`.
+No `sudo` required. If the binary is missing, `Mem Used`, `Mem Pressure`, `Mem Free%`, and `Mem Swap` read `N/A`.
 
 `Mem Used` is `%.2f GB` (one step is ~11 MB on a 16 KB page machine). It is **not** cached by the watch loop — each `mem-plus` spawns a fresh `memsys`. What *can* freeze it is XNU: `host_statistics64` is rate-limited for non-platform (adhoc-signed) binaries like `memsys`, and serves a **global 1-second snapshot** after a random 2–10 live queries in that window. `/usr/bin/vm_stat` is a platform binary and is not throttled. `Mem Pressure` / `Mem Free%` use `memorystatus_get_level()`, a different path, so they can still move while `Mem Used` is glued. See "Why Mem Used can look frozen" below.
 
@@ -233,7 +254,7 @@ while :; do date "+%Y%m%d-%H%M%S"; mem-plus "llama-server|python" | jq .; sleep 
 
 `sleep 10` is the recommended default for a **human-facing snapshot**, not a high-resolution profiler.
 
-Each `mem-plus` already burns about **1.5–2 s** of wall time before the sleep (`memgpu` 300 ms, `membw` 200 ms, `top -l 2 -s 1` a full second). So a `sleep 10` loop is really sampling about every **12 s**. That is well above XNU's **1 s** `host_statistics64` cache window, so `Mem Used` will not freeze because of that cache.
+Each `mem-plus` with a process pattern already burns about **1.5–2 s** of wall time before the sleep (`memgpu` 300 ms, `membw` 200 ms, `top -l 2 -s 1` a full second). So a `sleep 10` loop is really sampling about every **12 s**. That is well above XNU's **1 s** `host_statistics64` cache window, so `Mem Used` will not freeze because of that cache. A no-argument run skips `top`, so it returns after the GPU and bandwidth samples (about half a second) plus `memsys`.
 
 **10 s is a good fit for:**
 
@@ -259,14 +280,15 @@ If a 10 s loop *looks* stuck, it is almost always one of these:
 
 1. **The rounded number really did not move.** Dual-serve idle can sit on the same hundredths digit for a long time. Per-process `Mem` (Metal / `phys_footprint` via `memfoot`) can still change. `Mem Used` will not, until file-backed or empty-free pages move by ~11 MB.
 2. **A wall of identical `Total` blocks.** `pgrep -f` is a regex on the full command line. A pattern like `llama-server|python` matches the servers, **and** `mem-plus` itself (the pattern is on its argv), `sudo mem-plus …`, and a parent shell whose command line contains that string. Every JSON line repeats the same `Total.Mem Used`. Easy to eye-lock on an old block; a new loop puts a fresh block at the cursor.
-3. **A hung iteration, not a stale sampler.** If you print `date` *before* `mem-plus` and that run blocks in `top -l 2 -s 1`, you get a new timestamp and the previous jq blob still on screen. Ctrl-C kills the stuck child; the next run completes and looks like a refresh. Check stderr: you should see `Sampling GPU...` and `Sampling memory bandwidth...` finish with `Done` each cycle.
+3. **A hung iteration, not a stale sampler.** If you print `date` *before* `mem-plus` and that run blocks in `top -l 2 -s 1`, you get a new timestamp and the previous jq blob still on screen. Ctrl-C kills the stuck child; the next run completes and looks like a refresh. Check stderr: you should see `Sampling GPU power and memory bandwidth...` finish with `Done` each cycle.
 
 **Diagnostic:** `Mem Free%` / `Mem Pressure` come from `memorystatus_get_level()`, which is **not** the `host_statistics64` cache. If those two were moving while `Mem Used` was glued, that is the 1 s kernel cache. If the date froze too, `mem-plus` never finished. Compare `memsys` to `vm_stat` on the same tick (`hw.memsize` minus file-backed pages minus "Pages free"): if `vm_stat` moved and `memsys` did not, it is the rate-limit cache.
 
 ## Requirements / Notes
 - macOS on Apple Silicon (uses `memfoot`, `memsys`, `memgpu`, ps -o comm/rss, and IOReport for bandwidth and GPU power). No sudo.
+- Build with `make`. Install with `make install bindir=DIR` (`DIR` is required). That copies `mem-plus` and the four helpers into `DIR`.
 - `Mem` / `Mem Peak` require the bundled `memfoot` helper (`clang -O2 -o memfoot memfoot.c`). It reads `phys_footprint` via `proc_pid_rusage` and does not walk VM regions like `vmmap`, so it won't hitch live apps.
-- `Mem Used` / `Mem Pressure` / `Mem Free%` require `memsys` (`clang -O2 -o memsys memsys.c`).
+- `Mem Used` / `Mem Pressure` / `Mem Free%` / `Mem Swap` require `memsys` (`clang -O2 -o memsys memsys.c`). `Mem Swap` is `vm.swapusage` used bytes.
 - `GPU Power` / `GPU%` require `memgpu` (`clang -O2 -framework CoreFoundation -o memgpu memgpu.c`). No sudo: `GPU Energy` for power, `GPUPH` for active residency. CPU package power is not reported.
 - The `Mem BW` fields require the bundled `membw` helper (`clang -O2 -framework CoreFoundation -o membw membw.c`). No sudo: base M4 uses AMC Stats byte counters, M4 Pro / M4 Max use PMP histograms. Compiled binaries are gitignored — only the `.c` sources are tracked. If missing, those fields read `N/A`.
 - jq is only needed if you want pretty output; the tool itself emits valid JSON without it.

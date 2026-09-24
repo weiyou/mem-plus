@@ -4,9 +4,11 @@
 # =============================================================================
 #
 # Usage:
+#     mem-plus                                 # system Total only (no top)
 #     mem-plus <process-name-or-pattern>
 #
 # Example:
+#     mem-plus                                 # GPU, bandwidth, memory, swap
 #     mem-plus llama-server
 #     mem-plus mlx_lm.generate
 #     mem-plus "llama-server|python"      # pattern is passed to pgrep -f
@@ -18,20 +20,24 @@
 # format is intentional so the output is easy to grep, pipe, and append to logs.
 # To pretty-print, pipe through jq (see "BEAUTIFYING" below).
 #
+# With no pattern, or when the pattern matches no process, mem-plus prints one
+# line containing only "Total". It does not run top.
+#
 # Each line looks like:
 #
 #   {"<comm>": {"PID": N, "Mem": "..", "Mem Peak": "..", "RSS": "..",
 #               "CPU%": "..", "NCPU%": ".."},
 #    "Total": {"GPU Power": "..", "GPU%": "..",
-#              "Mem BW": "..", "Mem BW Max": "..",
-#              "Mem Used": "..", "Mem Pressure": "..", "Mem Free%": ".."}}
+#              "Mem BW": "..", "Mem BW Max": "..", "Mem Free%": "..",
+#              "Mem Pressure": "..", "Mem Swap": "..", "Mem Used": ".."}}
 #
 # Fields:
 #   <comm>      Last 80 chars of the process command path (the JSON key).
 #   PID         Process id.
 #   Mem         Physical footprint (memfoot helper). What Activity Monitor calls
 #               "Memory". The number you should trust for real RAM cost.
-#   Mem Peak    Peak physical footprint since the process started.
+#               1024-based, labeled KB (under 1 MB), MB, or GB.
+#   Mem Peak    Peak physical footprint since the process started. Same units.
 #   RSS         Resident Set Size (ps -o rss), in MB. A cross-check metric;
 #               see "RSS vs Mem" below for why it can differ wildly.
 #   CPU%        Instantaneous %CPU, htop-style. Measured with `top -l 2 -s 1`
@@ -40,7 +46,8 @@
 #               exceed 100%. (See "WHY CPU% IS MEASURED THIS WAY" below.)
 #   NCPU%       CPU% normalized by logical core count (hw.ncpu): CPU% / ncpu.
 #               Caps at ~100% = the process is using the entire machine.
-#   Total       System-wide metrics, sampled ONCE per invocation:
+#   Total       System-wide metrics, sampled ONCE per invocation. Keys are
+#               emitted in alphabetical order:
 #     GPU Power   GPU power from the IOReport "GPU Energy" channel (memgpu
 #                 helper, no sudo). The mJ "GPU" channel is the fallback when
 #                 "GPU Energy" does not move. N/A if memgpu is missing.
@@ -51,21 +58,28 @@
 #     Mem BW Max  Session high-water mark for Mem BW: the highest value seen
 #                 across repeated mem-plus runs. Persisted in
 #                 /tmp/mem-plus-membw-max; delete that file to reset it.
+#     Mem Free%   Percent of RAM available (memorystatus_get_level; same as
+#                 memory_pressure(1)'s "System-wide memory free percentage").
+#     Mem Pressure System memory pressure: Normal, Warn, or Critical — derived
+#                 from memorystatus_get_level() free % (AM's pressure graph).
+#     Mem Swap    Swap used (vm.swapusage xsu_used). Activity Monitor's
+#                 "Swap Used". 1024-based, two decimal places: MB below 1 GB,
+#                 GB at or above. N/A if memsys is missing.
 #     Mem Used    System-wide RAM used (memsys helper). The "Memory Used" label
 #                 in Activity Monitor: physical - file-backed - empty free.
 #                 That is larger than App + Wired + Compressed. Cached Files
 #                 already includes purgeable pages, and the label still counts them.
-#     Mem Pressure System memory pressure: Normal, Warn, or Critical — derived
-#                 from memorystatus_get_level() free % (AM's pressure graph).
-#     Mem Free%   Percent of RAM available (memorystatus_get_level; same as
-#                 memory_pressure(1)'s "System-wide memory free percentage").
 #
 # Note: the "Total" block is system-wide (a single sample), not per-process, so
-# it repeats identically on every process line.
+# it repeats identically on every process line. With no arguments, or when
+# nothing matches, it is the whole line.
 #
-# Units: memory sizes (Mem, Mem Peak, Mem Used, RSS) use 1024-based divisors
-# (MiB/GiB) but are labeled MB/GB like Activity Monitor. Mem BW uses decimal
-# 10^9 bytes/s (GB/s) — the throughput convention, not 1024-based.
+# Units: memory sizes (Mem, Mem Peak, Mem Swap, Mem Used, RSS) use 1024-based
+# divisors (KiB/MiB/GiB) but are labeled KB/MB/GB like Activity Monitor.
+# Mem and Mem Peak are KB under 1 MB, MB under 1 GB, and GB at or above.
+# Mem Swap is MB under 1 GB and GB at or above (two decimal places).
+# Mem Used is always GB. Mem BW uses decimal 10^9 bytes/s (GB/s) — the
+# throughput convention, not 1024-based.
 #
 # Why Mem BW comes from a bundled helper, not powermetrics: powermetrics on
 # Apple Silicon exposes no memory-bandwidth sampler (its samplers are only
@@ -96,9 +110,10 @@
 # Build once:
 #     clang -O2 -o memfoot memfoot.c
 #
-# System Mem Used / Pressure / Free% come from memsys (memsys.c):
+# System Mem Used / Pressure / Free% / Swap come from memsys (memsys.c):
 # hw.memsize - file-backed - empty free for the Memory Used label,
-# memorystatus_get_level() for free % / pressure.
+# memorystatus_get_level() for free % / pressure,
+# vm.swapusage xsu_used for Mem Swap.
 # Build once:
 #     clang -O2 -o memsys memsys.c
 #
@@ -122,8 +137,8 @@
 #
 # Real data from this tool:
 #
-#   llama-server   ->  "Mem": "845.5M", "RSS": "3098.3 MB"   (RSS >> Mem)
-#   mlx_lm python  ->  "Mem": "7.4G",   "RSS": "1789.4 MB"   (Mem >> RSS)
+#   llama-server   ->  "Mem": "845.5 MB", "RSS": "3098.3 MB"   (RSS >> Mem)
+#   mlx_lm python  ->  "Mem": "7.4 GB",   "RSS": "1789.4 MB"   (Mem >> RSS)
 #
 # Why each diverges:
 #
@@ -186,9 +201,9 @@
 #     while :; do date "+%Y%m%d-%H%M%S"; mem-plus "llama-server|python" | jq .; sleep 10; done
 #
 # sleep 10 is the recommended default (human-facing snapshot, not a profiler).
-# Each invocation already takes ~1.5–2 s (memgpu 300 ms, membw 200 ms,
-# top -l 2 -s 1 a full second), so the real period is ~12 s — well above XNU's
-# 1 s host_statistics64 cache window. 2–3 s only if you are watching a live
+# Each invocation with a process pattern already takes ~1.5–2 s (memgpu 300 ms,
+# membw 200 ms, top -l 2 -s 1 a full second), so the real period is ~12 s — well
+# above XNU's 1 s host_statistics64 cache window. 2–3 s only if you are watching a live
 # generation (GPU%/BW); 30–60 s for a babysitter; do not go under ~2 s unless
 # you drop top.
 #
@@ -204,13 +219,17 @@
 # REQUIREMENTS / NOTES
 # -----------------------------------------------------------------------------
 #   * macOS (uses memfoot, memgpu, ps -o comm/rss). No sudo.
+#   * Build with `make`. Install with `make install bindir=DIR` — DIR is
+#     required, there is no default. That copies this script and the four
+#     helpers into DIR. The script runs the copies that sit beside it.
 #   * Mem / Mem Peak come from the bundled `memfoot` helper (memfoot.c), which
 #     must be compiled once: clang -O2 -o memfoot memfoot.c
 #     It reads phys_footprint via proc_pid_rusage (same source as Activity
 #     Monitor) and does not walk VM regions like vmmap, so it won't hitch mpv
 #     or other live workloads. If the memfoot binary is missing, Mem reads N/A.
-#   * Mem Used / Mem Pressure / Mem Free% come from `memsys` (memsys.c):
-#     clang -O2 -o memsys memsys.c — Activity Monitor's system-wide memory tab.
+#   * Mem Used / Mem Pressure / Mem Free% / Mem Swap come from `memsys`
+#     (memsys.c): clang -O2 -o memsys memsys.c — Activity Monitor's
+#     system-wide memory tab. Mem Swap is vm.swapusage used bytes.
 #   * The "Mem BW" fields come from the bundled `membw` helper (membw.c), which
 #     must be compiled once: clang -O2 -framework CoreFoundation -o membw membw.c
 #     No sudo. Base M4 uses AMC Stats byte counters; M4 Pro / M4 Max use
@@ -224,13 +243,9 @@
 #     JSON without it.
 # =============================================================================
 
-if [ -z "$1" ]; then
-    echo "Usage: mem-plus <process-name-or-pattern>"
-    echo "Example: mem-plus mlx_lm.generate"
-    exit 1
-fi
-
-PATTERN="$1"
+# No argument, or a pattern that matches nothing: system Total only. A pattern
+# that matches selects processes and repeats Total on each of those lines.
+PATTERN="${1:-}"
 # === Memory bandwidth sampling interval (in seconds) ===
 # Default = 1.0 (1 second average)
 # Use shorter values (e.g. 0.1 or 0.15) for better peak resolution during
@@ -248,22 +263,18 @@ bw_interval=${MEMPLUS_BW_INTERVAL:-0.2}
 # NOT interfere with smartctl. Build once:
 #     clang -O2 -framework CoreFoundation -o membw membw.c
 membw_bin="${0:A:h}/membw"
-printf "Sampling memory bandwidth..." >&2
+gpu_power=""; gpu_pct=""
+memgpu_bin="${0:A:h}/memgpu"
+gpu_interval=${MEMPLUS_GPU_INTERVAL:-0.3}
+printf "Sampling GPU power and memory bandwidth..." >&2
 if [ -x "$membw_bin" ]; then
     membw=$("$membw_bin" "$bw_interval" 2>/dev/null)
     membw=$(awk -v v="$membw" 'BEGIN{if (v=="") exit 1; printf "%.1f", v}') || membw=""
 fi
-printf " Done\n" >&2
-
-# === GPU power and HW active residency (IOReport, no sudo) ===
 # memgpu prints "<milliwatts> <percent>". CPU package power is omitted: the
 # Energy Model mJ counters do not advance without root, so a reading would be
 # a false 0 W. See memgpu.c. Default window is 0.3 s (the old powermetrics
 # interval). Override with MEMPLUS_GPU_INTERVAL.
-gpu_power=""; gpu_pct=""
-memgpu_bin="${0:A:h}/memgpu"
-gpu_interval=${MEMPLUS_GPU_INTERVAL:-0.3}
-printf "Sampling GPU..." >&2
 if [ -x "$memgpu_bin" ]; then
     read -r gpu_mw gpu_raw <<< "$("$memgpu_bin" "$gpu_interval" 2>/dev/null)"
     if [[ "$gpu_mw" == <-> ]]; then
@@ -275,13 +286,23 @@ if [ -x "$memgpu_bin" ]; then
 fi
 printf " Done\n" >&2
 
-# === System-wide memory used + pressure (Activity Monitor Memory tab) ===
+# === System-wide memory used + pressure + swap (Activity Monitor Memory tab) ===
+# memsys prints: "<used_gb> <pressure> <free_pct> <swap used>"
+# The swap field is the display string and may contain a space ("2.04 GB").
 memsys_bin="${0:A:h}/memsys"
-mem_used=""; mem_pressure=""; mem_free_pct=""
+mem_used=""; mem_pressure=""; mem_free_pct=""; mem_swap=""
 if [ -x "$memsys_bin" ]; then
-    read -r mem_used_gb mem_pressure mem_free_pct <<< "$("$memsys_bin" 2>/dev/null)"
-    mem_used="${mem_used_gb} GB"
-    mem_free_pct="${mem_free_pct}%"
+    memsys_line=$("$memsys_bin" 2>/dev/null)
+    if [ -n "$memsys_line" ]; then
+        mem_used_gb=${memsys_line%% *}
+        rest=${memsys_line#* }
+        mem_pressure=${rest%% *}
+        rest=${rest#* }
+        mem_free_raw=${rest%% *}
+        mem_swap=${rest#* }
+        mem_used="${mem_used_gb} GB"
+        mem_free_pct="${mem_free_raw}%"
+    fi
 fi
 
 # "Mem BW Max" is a decaying high-water mark, persisted in /tmp. It is the
@@ -328,9 +349,21 @@ else
     membw_max=$(awk -v p="${prev_max:-0}" 'BEGIN{printf "%.1f", p}')
 fi
 
-# === Collect matching PIDs ===
-pids=($(pgrep -f "$PATTERN"))
-[ ${#pids[@]} -eq 0 ] && exit 0
+# Total keys stay in alphabetical order. Both the totals-only line and every
+# per-process line use this same object.
+total_fields="\"GPU Power\": \"${gpu_power:-N/A}\", \"GPU%\": \"${gpu_pct:-N/A}\", \"Mem BW\": \"${membw:-N/A} GB/s\", \"Mem BW Max\": \"${membw_max:-N/A} GB/s\", \"Mem Free%\": \"${mem_free_pct:-N/A}\", \"Mem Pressure\": \"${mem_pressure:-N/A}\", \"Mem Swap\": \"${mem_swap:-N/A}\", \"Mem Used\": \"${mem_used:-N/A}\""
+
+# No pattern, or a pattern that matches nothing: one Total line, no top.
+pids=()
+if [ -n "$PATTERN" ]; then
+    pids=($(pgrep -f "$PATTERN"))
+fi
+if [ ${#pids[@]} -eq 0 ]; then
+    cat <<EOF
+{"Total": {$total_fields}}
+EOF
+    exit 0
+fi
 
 # === Instantaneous %CPU for ALL pids in one shot (htop-style) ===
 # `top -l 2 -s 1` emits two samples; the SECOND is a true 1s delta. We keep the
@@ -358,9 +391,14 @@ for pid in $pids; do
 
     # Memory — phys_footprint via proc_pid_rusage (Activity Monitor's source).
     # Unlike vmmap, this does not walk every VM region and won't hitch mpv.
+    # memfoot prints "<number> <unit> <number> <unit>", e.g. "845.5 MB 1.1 GB".
     mem=""; mem_peak=""
     if [ -x "$memfoot_bin" ]; then
-        read -r mem mem_peak <<< "$("$memfoot_bin" "$pid" 2>/dev/null)"
+        memfoot_line=$("$memfoot_bin" "$pid" 2>/dev/null)
+        if [ -n "$memfoot_line" ]; then
+            mem=$(awk '{print $1, $2}' <<< "$memfoot_line")
+            mem_peak=$(awk '{print $3, $4}' <<< "$memfoot_line")
+        fi
     fi
 
     # RSS (resident set size) for comparison, like mem() in zshrc
@@ -374,7 +412,7 @@ for pid in $pids; do
 
     # Valid JSON output (one line per process — pipe to `jq .` to beautify)
     cat <<EOF
-{"$proc_name": {"PID": $pid, "Mem": "${mem:-N/A}", "Mem Peak": "${mem_peak:-N/A}", "RSS": "${rss:-N/A}", "CPU%": "${cpu_pct}%", "NCPU%": "${ncpu_pct}%"}, "Total": {"GPU Power": "${gpu_power:-N/A}", "GPU%": "${gpu_pct:-N/A}", "Mem BW": "${membw:-N/A} GB/s", "Mem BW Max": "${membw_max:-N/A} GB/s", "Mem Used": "${mem_used:-N/A}", "Mem Pressure": "${mem_pressure:-N/A}", "Mem Free%": "${mem_free_pct:-N/A}"}}
+{"$proc_name": {"PID": $pid, "Mem": "${mem:-N/A}", "Mem Peak": "${mem_peak:-N/A}", "RSS": "${rss:-N/A}", "CPU%": "${cpu_pct}%", "NCPU%": "${ncpu_pct}%"}, "Total": {$total_fields}}
 EOF
 
 done
