@@ -233,7 +233,8 @@
 #   * The "Mem BW" fields come from the bundled `membw` helper (membw.c), which
 #     must be compiled once: clang -O2 -framework CoreFoundation -o membw membw.c
 #     No sudo. Base M4 uses AMC Stats byte counters; M4 Pro / M4 Max use
-#     PMP histograms. If the membw binary is missing, "Mem BW" reads
+#     PMP histograms; M3 Ultra sums the per-die PMP0/PMP1 AMCC histograms.
+#     If the membw binary is missing, "Mem BW" reads
 #     "N/A GB/s" and everything else still works.
 #   * GPU Power / GPU% come from `memgpu` (memgpu.c):
 #     clang -O2 -framework CoreFoundation -o memgpu memgpu.c
@@ -259,7 +260,9 @@ bw_interval=${MEMPLUS_BW_INTERVAL:-0.2}
 # this script) prints combined read+write GB/s and does not call sudo.
 # Base M4: AMC "DCS RD"/"DCS WR" byte counters subscribe as a normal user.
 # M4 Pro / M4 Max: AMC Stats will not subscribe, so PMP "DCS BW"/AMCC
-# histograms are used instead. It opens no disk/NVMe user client, so it does
+# histograms are used instead. M3 Ultra: same AMC rejection; the dies are
+# PMP0/AMCC0 and PMP1/AMCC1 and those histograms are summed. It opens no
+# disk/NVMe user client, so it does
 # NOT interfere with smartctl. Build once:
 #     clang -O2 -framework CoreFoundation -o membw membw.c
 membw_bin="${0:A:h}/membw"

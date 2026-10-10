@@ -193,10 +193,13 @@ clang -O2 -framework CoreFoundation -o membw membw.c
 |------|-----------------|------|
 | **M4** | AMC Stats byte counters `DCS RD` / `DCS WR` | **no** |
 | **M4 Pro, M4 Max** | PMP `DCS BW` / `AMCC RD+WR` rate histograms | **no** |
+| **M3 Ultra** | `PMP0` + `PMP1` `DCS BW` / `AMCC0` + `AMCC1` `RD+WR`, summed | **no** |
 
 On a base M4 the AMC Stats group subscribes as a normal user, and `DCS RD` + `DCS WR` are live byte counters. Checked on a Mac mini (Mac16,10, macOS 27): desktop idle was a few GB/s, and an 8-thread copy held 105.8 GB/s, matching the `DCS` aggregate for the same window.
 
 On M4 Pro the AMC Stats group will not subscribe (`IOReportCreateSubscription` returns NULL — ~190 channels including `DCS F1`–`F6` bins; the names `DCS RD`/`DCS WR` exist in the catalog but never appear in a sample delta). That is why `Mem BW` used to read `N/A`. PMP subscribes without root. Its AMCC histograms are 32 residency buckets labeled `16GB/s`…`512GB/s`. The first bucket is an underflow bin (everything below 16 GB/s, including true idle ~0.1 GB/s on an M4-base AMC reading); membw counts that bucket as 0 and takes a residency-weighted average of the rest, otherwise idle would be a phantom 16 GB/s. Traffic that stays entirely under 16 GB/s is therefore indistinguishable from idle.
+
+On M3 Ultra the same AMC rejection happens, and it happens for a single channel, not only for the 305-channel catalog. The plain `PMP` group is empty. Each die has its own group: `PMP0` / `AMCC0 RD+WR` and `PMP1` / `AMCC1 RD+WR`. Those are per-controller aggregates, so membw sums them. The buckets run `64GB/s`…`2048GB/s` in steps of 64; bucket 0 is still the underflow, and counting it as 64 would report a phantom 128 GB/s at idle. Checked on a Mac Studio (Mac15,14, 256 GB): idle read 0, an 8-bit Qwen3.8-27B prefill stayed in the low tens of GB/s, and decode held about 560 GB/s, about 70% of the 819 GB/s peak. Anything that stays under 64 GB/s on a die sits in the underflow bin and reads as 0 on that die.
 
 `Mem BW Max` is a time-decaying peak of those samples (see below).
 
@@ -290,5 +293,5 @@ If a 10 s loop *looks* stuck, it is almost always one of these:
 - `Mem` / `Mem Peak` require the bundled `memfoot` helper (`clang -O2 -o memfoot memfoot.c`). It reads `phys_footprint` via `proc_pid_rusage` and does not walk VM regions like `vmmap`, so it won't hitch live apps.
 - `Mem Used` / `Mem Pressure` / `Mem Free%` / `Mem Swap` require `memsys` (`clang -O2 -o memsys memsys.c`). `Mem Swap` is `vm.swapusage` used bytes.
 - `GPU Power` / `GPU%` require `memgpu` (`clang -O2 -framework CoreFoundation -o memgpu memgpu.c`). No sudo: `GPU Energy` for power, `GPUPH` for active residency. CPU package power is not reported.
-- The `Mem BW` fields require the bundled `membw` helper (`clang -O2 -framework CoreFoundation -o membw membw.c`). No sudo: base M4 uses AMC Stats byte counters, M4 Pro / M4 Max use PMP histograms. Compiled binaries are gitignored — only the `.c` sources are tracked. If missing, those fields read `N/A`.
+- The `Mem BW` fields require the bundled `membw` helper (`clang -O2 -framework CoreFoundation -o membw membw.c`). No sudo: base M4 uses AMC Stats byte counters; M4 Pro / M4 Max use the `PMP` AMCC histogram; M3 Ultra sums the `PMP0`/`PMP1` `AMCC0`/`AMCC1` histograms. Compiled binaries are gitignored — only the `.c` sources are tracked. If missing, those fields read `N/A`.
 - jq is only needed if you want pretty output; the tool itself emits valid JSON without it.

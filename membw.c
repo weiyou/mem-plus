@@ -12,22 +12,32 @@
 //         "DCS RD" / "DCS WR"            aggregate DRAM bytes
 //         "DCS F<n> RD" / "DCS F<n> WR"  per-frequency-bin bytes
 //         "DCS"                          combined RD+WR bytes
+//      Subscribed as that filtered set, not the whole group. A large catalog
+//      makes IOReportCreateSubscription return NULL (M4 Pro ~190 channels;
+//      M3 Ultra 305, and on that chip even one AMC channel is rejected).
 //      On a base M4 Mac mini (Mac16,10, macOS 27) this subscribes as a
 //      normal user. Idle is a few GB/s; an all-core copy reads ~106 GB/s,
 //      matching DCS RD+WR.
 //
-//   2. PMP "DCS BW" / "AMCC RD|WR|RD+WR" rate histograms (M4 Pro / M4 Max,
-//      and any chip where AMC Stats will not subscribe). These are 32-bucket
-//      residencies labeled "16GB/s".."512GB/s" on M4 Pro. The first bucket is
-//      an underflow bin (everything below the first label, including true
-//      idle ~0.1 GB/s); treating its label as 16 made idle look like a
-//      phantom 16 GB/s. Bucket 0 is counted as 0; higher buckets keep their
-//      labels. PMP subscribes without root.
+//   2. PMP "DCS BW" / "AMCC[n] RD|WR|RD+WR" rate histograms, when AMC byte
+//      counters will not subscribe. The group is "PMP" on a single die
+//      (M4 Pro / M4 Max: "AMCC RD+WR") and "PMP0", "PMP1", ... on an Ultra
+//      (M3 Ultra: "AMCC0 RD+WR" on PMP0 and "AMCC1 RD+WR" on PMP1). Those
+//      are per-die memory-controller aggregates, so they are summed.
+//      32-bucket residencies. Labels start at "16GB/s" on M4 Pro and
+//      "64GB/s" on M3 Ultra; the top of the M3 Ultra scale is "2048GB/s".
+//      The first bucket is an underflow bin (everything below the first
+//      label, including true idle). Treating its label as the rate made
+//      idle look like a phantom 16 or 64 GB/s per die. Bucket 0 is counted
+//      as 0; higher buckets keep their labels. PMP subscribes without root.
 //
-// Why M4 Pro cannot use (1): the M4 Pro AMC Stats group has ~190 channels
-// including DCS F1–F6 bins, and IOReportCreateSubscription on that group
-// alone returns NULL. The aggregate names "DCS RD"/"DCS WR" exist in the
-// channel catalog but never appear in a sample delta. PMP is the working path.
+// Why M4 Pro and M3 Ultra cannot use (1): IOReportCreateSubscription on
+// AMC Stats returns NULL. On M4 Pro the aggregate names exist in the
+// catalog but never appear in a sample delta. On M3 Ultra (Mac15,14) a
+// one-channel subscription fails the same way, while the per-die PMP
+// histograms move: desktop idle is 0, an 8-bit Qwen3.8-27B prefill stays
+// in the low tens of GB/s, and decode holds ~560 GB/s (~70% of the
+// 819 GB/s peak).
 //
 // This helper never opens an NVMe/disk IOKit user client, so it cannot lock
 // out smartctl the way a full mactop sample can.
@@ -54,6 +64,7 @@ typedef struct IOReportSubscription *IOReportSubscriptionRef;
 
 typedef CFMutableDictionaryRef (*copy_chans_t)(CFStringRef, CFStringRef,
                                                uint64_t, uint64_t, uint64_t);
+typedef void (*merge_chans_t)(CFDictionaryRef, CFDictionaryRef, CFTypeRef);
 typedef IOReportSubscriptionRef (*create_sub_t)(void *, CFMutableDictionaryRef,
                                                 CFMutableDictionaryRef *,
                                                 uint64_t, CFTypeRef);
@@ -69,6 +80,7 @@ typedef CFStringRef (*state_name_t)(CFDictionaryRef, int32_t);
 typedef int64_t (*state_res_t)(CFDictionaryRef, int32_t);
 
 static copy_chans_t IOReportCopyChannelsInGroup;
+static merge_chans_t IOReportMergeChannels;
 static create_sub_t IOReportCreateSubscription;
 static create_samples_t IOReportCreateSamples;
 static samples_delta_t IOReportCreateSamplesDelta;
@@ -114,10 +126,40 @@ static CFArrayRef channels_of(CFDictionaryRef dict) {
     return CFDictionaryGetValue(dict, CFSTR("IOReportChannels"));
 }
 
-// Keep only PMP DCS-BW AMCC histograms so we don't subscribe to 500+ channels.
-static CFMutableDictionaryRef filter_pmp_amcc(CFDictionaryRef pmp) {
-    CFArrayRef arr = channels_of(pmp);
-    if (!arr)
+// "AMCC RD+WR" on a single die, "AMCC0 RD+WR" / "AMCC1 RD" on an Ultra.
+// Returns 3 for RD+WR, 1 for RD, 2 for WR, 0 if this is not an AMCC rate.
+static int amcc_direction(const char *name) {
+    if (strncmp(name, "AMCC", 4) != 0)
+        return 0;
+    const char *p = name + 4;
+    while (*p >= '0' && *p <= '9')
+        p++;
+    if (*p != ' ')
+        return 0;
+    p++;
+    if (strcmp(p, "RD+WR") == 0)
+        return 3;
+    if (strcmp(p, "RD") == 0)
+        return 1;
+    if (strcmp(p, "WR") == 0)
+        return 2;
+    return 0;
+}
+
+static int is_amc_byte_channel(const char *name) {
+    if (strcmp(name, "DCS RD") == 0 || strcmp(name, "DCS WR") == 0 ||
+        strcmp(name, "DCS") == 0)
+        return 1;
+    return is_freq_bin_dcs(name, " RD") || is_freq_bin_dcs(name, " WR");
+}
+
+// Keep channels selected by `keep_name`. The result is a mutable copy of
+// `src` whose IOReportChannels array is only the matches.
+static CFMutableDictionaryRef filter_channels(CFDictionaryRef src,
+                                              int (*keep_name)(const char *,
+                                                               const char *)) {
+    CFArrayRef arr = channels_of(src);
+    if (!arr || !keep_name)
         return NULL;
     CFMutableArrayRef keep =
         CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
@@ -129,7 +171,7 @@ static CFMutableDictionaryRef filter_pmp_amcc(CFDictionaryRef pmp) {
         char sub[64] = {0}, name[128] = {0};
         cf_to_buf(IOReportChannelGetSubGroup(ch), sub, sizeof(sub));
         cf_to_buf(IOReportChannelGetChannelName(ch), name, sizeof(name));
-        if (strcmp(sub, "DCS BW") == 0 && strncmp(name, "AMCC ", 5) == 0)
+        if (keep_name(sub, name))
             CFArrayAppendValue(keep, ch);
     }
     if (CFArrayGetCount(keep) == 0) {
@@ -137,7 +179,7 @@ static CFMutableDictionaryRef filter_pmp_amcc(CFDictionaryRef pmp) {
         return NULL;
     }
     CFMutableDictionaryRef out =
-        CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, pmp);
+        CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, src);
     if (!out) {
         CFRelease(keep);
         return NULL;
@@ -145,6 +187,60 @@ static CFMutableDictionaryRef filter_pmp_amcc(CFDictionaryRef pmp) {
     CFDictionarySetValue(out, CFSTR("IOReportChannels"), keep);
     CFRelease(keep);
     return out;
+}
+
+static int keep_amc_bytes(const char *sub, const char *name) {
+    (void)sub;
+    return is_amc_byte_channel(name);
+}
+
+// DCS BW only. AFC/AFI/AFR AMCC histograms are fabric, not DRAM, and read
+// a different number under the same GPU load.
+static int keep_pmp_amcc(const char *sub, const char *name) {
+    return strcmp(sub, "DCS BW") == 0 && amcc_direction(name) != 0;
+}
+
+// "PMP" plus "PMP0", "PMP1", ... until a numbered group is empty. An empty
+// plain "PMP" (M3 Ultra) is skipped; the numbered groups are the dies.
+static CFMutableDictionaryRef copy_pmp_amcc(void) {
+    CFMutableDictionaryRef merged = NULL;
+    for (int die = -1; die < 8; die++) {
+        char gname[8];
+        if (die < 0)
+            snprintf(gname, sizeof(gname), "PMP");
+        else
+            snprintf(gname, sizeof(gname), "PMP%d", die);
+        CFStringRef g = CFStringCreateWithCString(kCFAllocatorDefault, gname,
+                                                  kCFStringEncodingUTF8);
+        CFDictionaryRef pmp = IOReportCopyChannelsInGroup(g, NULL, 0, 0, 0);
+        CFRelease(g);
+        CFArrayRef arr = channels_of(pmp);
+        long n = arr ? (long)CFArrayGetCount(arr) : 0;
+        if (n == 0) {
+            if (pmp)
+                CFRelease(pmp);
+            if (die >= 0)
+                break;
+            continue;
+        }
+        CFMutableDictionaryRef kept = filter_channels(pmp, keep_pmp_amcc);
+        CFRelease(pmp);
+        if (!kept)
+            continue;
+        if (!merged) {
+            merged = kept;
+            continue;
+        }
+        if (!IOReportMergeChannels) {
+            fprintf(stderr, "membw: IOReportMergeChannels missing; "
+                            "per-die bandwidth is incomplete\n");
+            CFRelease(kept);
+            break;
+        }
+        IOReportMergeChannels(merged, kept, NULL);
+        CFRelease(kept);
+    }
+    return merged;
 }
 
 static CFDictionaryRef take_delta(IOReportSubscriptionRef sub,
@@ -255,31 +351,43 @@ static double hist_avg_gbs(CFDictionaryRef ch) {
 }
 
 // Combined GB/s from PMP DCS-BW AMCC histograms, or -1 if none.
+// Per-die channels (AMCC0, AMCC1, ...) each cover one memory controller, so
+// they are summed. RD+WR wins over RD plus WR: those are the same traffic
+// split two ways, and each direction has its own underflow bin.
 static double gbs_from_pmp(CFDictionaryRef delta) {
     CFArrayRef arr = channels_of(delta);
     if (!arr)
         return -1.0;
 
-    double rd = -1.0, wr = -1.0, comb = -1.0;
+    double rd = 0.0, wr = 0.0, comb = 0.0;
+    int nrd = 0, nwr = 0, ncomb = 0;
     CFIndex n = CFArrayGetCount(arr);
     for (CFIndex i = 0; i < n; i++) {
         CFDictionaryRef ch = (CFDictionaryRef)CFArrayGetValueAtIndex(arr, i);
         char sub[64] = {0}, name[128] = {0};
         cf_to_buf(IOReportChannelGetSubGroup(ch), sub, sizeof(sub));
         cf_to_buf(IOReportChannelGetChannelName(ch), name, sizeof(name));
-        if (strcmp(sub, "DCS BW") != 0)
+        int dir = amcc_direction(name);
+        if (strcmp(sub, "DCS BW") != 0 || dir == 0)
             continue;
-        if (strcmp(name, "AMCC RD+WR") == 0)
-            comb = hist_avg_gbs(ch);
-        else if (strcmp(name, "AMCC RD") == 0)
-            rd = hist_avg_gbs(ch);
-        else if (strcmp(name, "AMCC WR") == 0)
-            wr = hist_avg_gbs(ch);
+        double avg = hist_avg_gbs(ch);
+        if (avg < 0.0)
+            continue;
+        if (dir == 3) {
+            comb += avg;
+            ncomb++;
+        } else if (dir == 1) {
+            rd += avg;
+            nrd++;
+        } else if (dir == 2) {
+            wr += avg;
+            nwr++;
+        }
     }
-    if (comb >= 0.0)
+    if (ncomb)
         return comb;
-    if (rd >= 0.0 || wr >= 0.0)
-        return (rd > 0.0 ? rd : 0.0) + (wr > 0.0 ? wr : 0.0);
+    if (nrd || nwr)
+        return rd + wr;
     return -1.0;
 }
 
@@ -298,6 +406,8 @@ static int load_ioreport(void) {
 
     IOReportCopyChannelsInGroup =
         (copy_chans_t)dlsym(lib, "IOReportCopyChannelsInGroup");
+    IOReportMergeChannels =
+        (merge_chans_t)dlsym(lib, "IOReportMergeChannels");
     IOReportCreateSubscription =
         (create_sub_t)dlsym(lib, "IOReportCreateSubscription");
     IOReportCreateSamples = (create_samples_t)dlsym(lib, "IOReportCreateSamples");
@@ -323,6 +433,29 @@ static int load_ioreport(void) {
     return 1;
 }
 
+// Prints a line and returns 1 when this channel set yields a usable AMC
+// reading, including a genuine idle 0. Subscription failure and a delta
+// with no DCS byte channels both return 0 so the caller can try PMP.
+static int emit_amc(CFMutableDictionaryRef chans, double interval) {
+    if (!chans)
+        return 0;
+    CFMutableDictionaryRef subbed = NULL;
+    IOReportSubscriptionRef sub =
+        IOReportCreateSubscription(NULL, chans, &subbed, 0, NULL);
+    if (!sub)
+        return 0;
+    CFMutableDictionaryRef sample_chans = subbed ? subbed : chans;
+    double dt = 0;
+    CFDictionaryRef delta = take_delta(sub, sample_chans, interval, &dt);
+    if (!delta || dt <= 0)
+        return 0;
+    double gbs = gbs_from_amc(delta, dt);
+    if (gbs < 0.0)
+        return 0;
+    printf("%.2f\n", gbs);
+    return 1;
+}
+
 int main(int argc, char **argv) {
     double interval = (argc > 1) ? atof(argv[1]) : 1.0;
     if (interval <= 0)
@@ -332,51 +465,38 @@ int main(int argc, char **argv) {
         return 1;
 
     // --- Path 1: AMC Stats byte counters (M1 / M4 base) ----------------------
+    // The filtered set is what gbs_from_amc reads. Subscribing to the whole
+    // group fails when the catalog is large. If the filtered subscribe fails,
+    // the unfiltered group is still tried so a small M4 catalog keeps the
+    // path that was checked there.
     CFMutableDictionaryRef amc =
         IOReportCopyChannelsInGroup(CFSTR("AMC Stats"), NULL, 0, 0, 0);
     if (!amc)
         amc = IOReportCopyChannelsInGroup(CFSTR("AMC"), NULL, 0, 0, 0);
 
     if (amc) {
-        CFMutableDictionaryRef subbed = NULL;
-        IOReportSubscriptionRef sub =
-            IOReportCreateSubscription(NULL, amc, &subbed, 0, NULL);
-        CFMutableDictionaryRef sample_chans = subbed ? subbed : amc;
-        if (sub) {
-            double dt = 0;
-            CFDictionaryRef delta = take_delta(sub, sample_chans, interval, &dt);
-            if (delta && dt > 0) {
-                double gbs = gbs_from_amc(delta, dt);
-                // A usable AMC reading (including genuine idle 0) wins.
-                // -1 means the delta had no DCS byte channels — fall through
-                // to PMP (the M4 Pro case: subscription may succeed when
-                // merged, but AMC never appears in the delta).
-                if (gbs >= 0.0) {
-                    printf("%.2f\n", gbs);
-                    return 0;
-                }
-            }
-        }
+        CFMutableDictionaryRef filtered = filter_channels(amc, keep_amc_bytes);
+        if (emit_amc(filtered, interval))
+            return 0;
+        if (filtered && emit_amc(amc, interval))
+            return 0;
     }
 
-    // --- Path 2: PMP DCS-BW AMCC histograms (M4 Pro / M4 Max) ----------------
-    CFMutableDictionaryRef pmp =
-        IOReportCopyChannelsInGroup(CFSTR("PMP"), NULL, 0, 0, 0);
+    // --- Path 2: PMP DCS-BW AMCC histograms (M4 Pro / M4 Max / M3 Ultra) -----
+    CFMutableDictionaryRef pmp = copy_pmp_amcc();
     if (!pmp) {
-        fprintf(stderr, "membw: no AMC Stats sample and no PMP group\n");
+        fprintf(stderr, "membw: no AMC Stats sample and no PMP AMCC histogram\n");
         return 1;
     }
-    CFMutableDictionaryRef pmp_amcc = filter_pmp_amcc(pmp);
-    CFMutableDictionaryRef pmp_chans = pmp_amcc ? pmp_amcc : pmp;
 
     CFMutableDictionaryRef subbed = NULL;
     IOReportSubscriptionRef sub =
-        IOReportCreateSubscription(NULL, pmp_chans, &subbed, 0, NULL);
+        IOReportCreateSubscription(NULL, pmp, &subbed, 0, NULL);
     if (!sub) {
         fprintf(stderr, "membw: IOReportCreateSubscription failed\n");
         return 1;
     }
-    CFMutableDictionaryRef sample_chans = subbed ? subbed : pmp_chans;
+    CFMutableDictionaryRef sample_chans = subbed ? subbed : pmp;
     double dt = 0;
     CFDictionaryRef delta = take_delta(sub, sample_chans, interval, &dt);
     if (!delta || dt <= 0) {
